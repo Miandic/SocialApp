@@ -112,6 +112,34 @@ export const messenger = {
   },
 };
 
+// ─── Media ───
+export const media = {
+  upload: async (files) => {
+    const form = new FormData();
+    for (const f of files) form.append("files", f);
+    const token = getToken();
+    const headers = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    const doFetch = () =>
+      fetch(`${BASE}/media/upload`, { method: "POST", headers, body: form });
+
+    let res = await doFetch();
+    if (res.status === 401) {
+      const refreshed = await tryRefresh();
+      if (!refreshed) {
+        clearTokens();
+        window.dispatchEvent(new Event("auth:logout"));
+        throw { error: "unauthorized", message: "Session expired" };
+      }
+      headers["Authorization"] = `Bearer ${getToken()}`;
+      res = await doFetch();
+    }
+    if (!res.ok) throw await res.json();
+    return res.json(); // [{url, key}]
+  },
+};
+
 // ─── Notifications ───
 export const notifications = {
   list: (params = "") => request("GET", `/notifications?${params}`),

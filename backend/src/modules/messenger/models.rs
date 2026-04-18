@@ -36,6 +36,11 @@ pub enum WsClientMessage {
     RequestKeyBundle {
         user_id: Uuid,
     },
+    /// Delete a message (only sender can delete their own)
+    DeleteMessage {
+        chat_id: Uuid,
+        message_id: Uuid,
+    },
 }
 
 /// Server → Client messages
@@ -72,6 +77,11 @@ pub enum WsServerMessage {
         signed_pre_key: String,
         signed_pre_key_signature: String,
         one_time_pre_key: Option<String>,
+    },
+    /// A message was deleted
+    MessageDeleted {
+        chat_id: Uuid,
+        message_id: Uuid,
     },
     /// Error
     Error {

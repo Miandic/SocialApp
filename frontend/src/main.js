@@ -149,6 +149,9 @@ function handleWsMessage(msg) {
     case "messages_read":
       handleMessagesRead(msg);
       break;
+    case "message_deleted":
+      handleMessageDeleted(msg);
+      break;
     case "error":
       console.warn("[WS] Error:", msg.message);
       toast(msg.message || "Server error");
@@ -190,6 +193,14 @@ function handleTyping(msg) {
         indicator.textContent = "";
       }, 2000);
     }
+  }
+}
+
+function handleMessageDeleted(msg) {
+  const el = document.querySelector(`[data-message-id="${msg.message_id}"]`);
+  if (el) {
+    el.classList.add("message-deleting");
+    setTimeout(() => el.remove(), 280);
   }
 }
 
@@ -874,10 +885,20 @@ async function openChat(chatId) {
     if (chat) {
       const name = getChatDisplayName(chat);
       const memberCount = chat.is_group ? ` (${chat.members.length} members)` : "";
+      const other = !chat.is_group
+        ? chat.members.find((m) => m.user_id !== currentUser?.id)
+        : null;
       document.getElementById("chat-header").innerHTML = `
-        <strong>${escapeHtml(name)}</strong>
+        ${other
+          ? `<strong class="chat-header-link" data-username="${escapeAttr(other.username)}">${escapeHtml(name)}</strong>`
+          : `<strong>${escapeHtml(name)}</strong>`}
         <span style="color:var(--text-muted);font-size:13px">${memberCount}</span>
       `;
+      if (other) {
+        document.querySelector(".chat-header-link")?.addEventListener("click", () => {
+          navigate("profile", { username: other.username });
+        });
+      }
     }
 
     const messages = await messenger.getMessages(chatId);
@@ -907,7 +928,28 @@ async function openChat(chatId) {
     `;
   }
 
+  // Sender name → profile navigation
+  document.getElementById("chat-messages")?.addEventListener("click", (e) => {
+    const sender = e.target.closest(".message-sender.user-link");
+    if (sender) navigate("profile", { username: sender.dataset.user });
+  });
+
+  // Right-click context menu on messages
+  document.getElementById("chat-messages")?.addEventListener("contextmenu", (e) => {
+    const msgEl = e.target.closest(".message");
+    if (!msgEl) return;
+    e.preventDefault();
+    showMsgCtxMenu(e.clientX, e.clientY, msgEl.dataset.messageId, msgEl.classList.contains("message-mine"));
+  });
+
   const inputEl = document.getElementById("chat-input");
+
+  // Strip formatting on paste — insert plain text only
+  inputEl.addEventListener("paste", (e) => {
+    e.preventDefault();
+    const text = e.clipboardData.getData("text/plain");
+    document.execCommand("insertText", false, text);
+  });
 
   document.getElementById("chat-input-form").onsubmit = (e) => {
     e.preventDefault();
@@ -922,6 +964,7 @@ async function openChat(chatId) {
     });
 
     inputEl.innerHTML = "";
+    inputEl.style.height = "";
     inputEl.focus();
   };
 
@@ -952,7 +995,7 @@ function renderMessage(msg) {
   });
   return `
     <div class="message ${isMe ? "message-mine" : "message-theirs"}" data-message-id="${msg.id}">
-      ${!isMe ? `<div class="message-sender">${escapeHtml(msg.sender_username)}</div>` : ""}
+      ${!isMe ? `<div class="message-sender user-link" data-user="${escapeAttr(msg.sender_username)}">${escapeHtml(msg.sender_username)}</div>` : ""}
       <div class="message-bubble ${isMe ? "bubble-mine" : "bubble-theirs"}">
         <div class="message-text">${renderRichText(msg.encrypted_content)}</div>
         <div class="message-time">${time}</div>
@@ -1151,32 +1194,38 @@ function showNewChatDialog() {
 function serializeRichText(el) {
   const spans = [];
 
-  function walk(node) {
+  function nodeStyle(node) {
+    if (node.nodeType !== Node.ELEMENT_NODE) return null;
+    if (node.dataset && node.dataset.style) return node.dataset.style;
+    if (node.nodeName === "STRONG" || node.nodeName === "B") return "bold";
+    return null;
+  }
+
+  function walk(node, inherited) {
     if (node.nodeType === Node.TEXT_NODE) {
-      if (node.textContent) spans.push({ t: node.textContent, s: null });
+      if (node.textContent) {
+        const s = inherited.length === 0 ? null
+                : inherited.length === 1 ? inherited[0]
+                : [...inherited];
+        spans.push({ t: node.textContent, s });
+      }
     } else if (node.nodeName === "BR") {
       spans.push({ t: "\n", s: null });
-    } else if (node.nodeName === "SPAN" || node.nodeName === "STRONG" || node.nodeName === "B") {
-      const s = node.dataset && node.dataset.style
-        ? node.dataset.style
-        : (node.nodeName === "STRONG" || node.nodeName === "B" ? "bold" : null);
-      spans.push({ t: node.textContent, s });
     } else {
-      node.childNodes.forEach(walk);
+      const s = nodeStyle(node);
+      const next = s ? [...inherited, s] : [...inherited];
+      node.childNodes.forEach((c) => walk(c, next));
     }
   }
 
-  el.childNodes.forEach(walk);
+  el.childNodes.forEach((c) => walk(c, []));
 
   // Merge consecutive unstyled runs
   const merged = [];
   for (const sp of spans) {
     const prev = merged[merged.length - 1];
-    if (prev && prev.s === null && sp.s === null) {
-      prev.t += sp.t;
-    } else {
-      merged.push({ ...sp });
-    }
+    if (prev && prev.s === null && sp.s === null) prev.t += sp.t;
+    else merged.push({ ...sp });
   }
   return JSON.stringify(merged);
 }
@@ -1193,84 +1242,292 @@ function renderRichText(content) {
   try {
     const spans = JSON.parse(content);
     if (!Array.isArray(spans)) return escapeHtml(content);
-    return spans
-      .map(({ t, s }) => {
-        if (!s) return escapeHtml(t).replace(/\n/g, "<br>");
-        switch (s) {
-          case "bold":      return `<strong>${escapeHtml(t)}</strong>`;
-          case "underline": return `<span class="text-underline">${escapeHtml(t)}</span>`;
-          case "strike":    return `<s>${escapeHtml(t)}</s>`;
-          case "mono":      return `<code class="text-mono">${escapeHtml(t)}</code>`;
-          case "rainbow":   return `<span class="text-rainbow">${renderRainbowChars(t)}</span>`;
-          case "wave":      return `<span class="text-wave">${renderWaveChars(t)}</span>`;
-          case "type":      return renderTypeChars(t);
-          default:          return escapeHtml(t);
-        }
-      })
-      .join("");
+    return spans.map(({ t, s }) => {
+      if (!s) return escapeHtml(t).replace(/\n/g, "<br>");
+      return applyStylesToHtml(t, Array.isArray(s) ? s : [s]);
+    }).join("");
   } catch {
     return escapeHtml(content);
   }
 }
 
-function renderRainbowChars(text) {
-  return [...text]
-    .map((ch, i) =>
-      ch === " "
-        ? " "
-        : `<span style="--i:${i}">${escapeHtml(ch)}</span>`
-    )
-    .join("");
+function applyStylesToHtml(text, styles) {
+  const hasWave    = styles.includes("wave");
+  const hasRainbow = styles.includes("rainbow");
+  const hasType    = styles.includes("type");
+
+  // Collect text-decoration for injection into inline-block chars
+  const decs = [];
+  if (styles.includes("underline")) decs.push("underline");
+  if (styles.includes("strike"))    decs.push("line-through");
+  const decStyle = decs.length ? `text-decoration:${decs.join(" ")};` : "";
+
+  // Build per-char animated content
+  let html;
+  if (hasWave && hasRainbow && hasType) {
+    html = `<span class="text-wave-rainbow-type">${renderWaveRainbowTypeChars(text, decStyle)}</span>`;
+  } else if (hasWave && hasRainbow) {
+    html = `<span class="text-wave-rainbow">${renderWaveRainbowChars(text, decStyle)}</span>`;
+  } else if (hasWave && hasType) {
+    html = `<span class="text-wave-type">${renderWaveTypeChars(text, decStyle)}</span>`;
+  } else if (hasRainbow && hasType) {
+    html = `<span class="text-rainbow-type">${renderRainbowTypeChars(text, decStyle)}</span>`;
+  } else if (hasWave) {
+    html = `<span class="text-wave">${renderWaveChars(text, decStyle)}</span>`;
+  } else if (hasRainbow) {
+    html = `<span class="text-rainbow">${renderRainbowChars(text, decStyle)}</span>`;
+  } else if (hasType) {
+    html = renderTypeChars(text, decStyle);
+  } else {
+    html = escapeHtml(text).replace(/\n/g, "<br>");
+  }
+
+  // For non-animated text, wrap underline/strike normally
+  if (!hasWave && !hasRainbow && !hasType) {
+    if (styles.includes("underline")) html = `<span style="text-decoration:underline">${html}</span>`;
+    if (styles.includes("strike"))    html = `<s>${html}</s>`;
+  }
+
+  // Wrap remaining styles — deduplicate by category
+  const seenCats = new Set();
+  for (const s of styles) {
+    if (s === "wave" || s === "rainbow" || s === "type") continue;
+    if (s === "underline" || s === "strike") continue; // handled above
+    if (s === "bold") { html = `<strong>${html}</strong>`; continue; }
+    if (s === "mono") { html = `<code class="text-mono">${html}</code>`; continue; }
+    if (s.startsWith("color:")) {
+      if (seenCats.has("color")) continue;
+      seenCats.add("color");
+      html = `<span style="color:${escapeAttr(s.slice(6))}">${html}</span>`; continue;
+    }
+    if (s.startsWith("font:")) {
+      if (seenCats.has("font")) continue;
+      seenCats.add("font");
+      const font = s.slice(5);
+      loadGoogleFont(font);
+      html = `<span style="font-family:'${escapeAttr(font)}',sans-serif">${html}</span>`; continue;
+    }
+    if (s.startsWith("size:")) {
+      if (seenCats.has("size")) continue;
+      seenCats.add("size");
+      const sz = { sm: "0.8em", lg: "1.3em", xl: "1.85em", xxl: "2.5em" }[s.slice(5)];
+      if (sz) html = `<span style="font-size:${sz};line-height:1.2">${html}</span>`;
+    }
+  }
+  return html;
 }
 
-function renderWaveChars(text) {
+function renderWaveChars(text, extraStyle = "") {
   return [...text]
     .map((ch, i) =>
-      ch === " "
-        ? " "
-        : `<span style="--i:${i}">${escapeHtml(ch)}</span>`
-    )
-    .join("");
+      ch === " " ? " "
+        : `<span style="--i:${i};${extraStyle}">${escapeHtml(ch)}</span>`
+    ).join("");
 }
 
-function renderTypeChars(text) {
+function renderRainbowChars(text, extraStyle = "") {
+  return [...text]
+    .map((ch, i) =>
+      ch === " " ? " "
+        : `<span style="--i:${i};${extraStyle}">${escapeHtml(ch)}</span>`
+    ).join("");
+}
+
+function renderTypeChars(text, extraStyle = "") {
   const chars = [...text];
   const delay = Math.min(60, 1800 / Math.max(chars.length, 1));
   return chars
     .map((ch, i) =>
-      `<span class="type-char" style="animation-delay:${Math.round(i * delay)}ms">${escapeHtml(ch)}</span>`
-    )
-    .join("");
+      `<span class="type-char" style="animation-delay:${Math.round(i * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
+    ).join("");
+}
+
+function renderWaveRainbowChars(text, extraStyle = "") {
+  return [...text]
+    .map((ch, i) =>
+      ch === " " ? " "
+        : `<span style="--i:${i};${extraStyle}">${escapeHtml(ch)}</span>`
+    ).join("");
+}
+
+function renderWaveTypeChars(text, extraStyle = "") {
+  const chars = [...text];
+  const delay = Math.min(60, 1800 / Math.max(chars.length, 1));
+  return chars
+    .map((ch, i) =>
+      ch === " " ? " "
+        : `<span style="--i:${i};--type-delay:${Math.round(i * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
+    ).join("");
+}
+
+function renderRainbowTypeChars(text, extraStyle = "") {
+  const chars = [...text];
+  const delay = Math.min(60, 1800 / Math.max(chars.length, 1));
+  return chars
+    .map((ch, i) =>
+      ch === " " ? " "
+        : `<span style="--i:${i};--type-delay:${Math.round(i * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
+    ).join("");
+}
+
+function renderWaveRainbowTypeChars(text, extraStyle = "") {
+  const chars = [...text];
+  const delay = Math.min(60, 1800 / Math.max(chars.length, 1));
+  return chars
+    .map((ch, i) =>
+      ch === " " ? " "
+        : `<span style="--i:${i};--type-delay:${Math.round(i * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
+    ).join("");
+}
+
+// ─── Google Fonts list ───
+
+const GOOGLE_FONTS = [
+  "Inter", "Roboto", "Open Sans", "Lato", "Montserrat", "Nunito", "Poppins",
+  "Raleway", "Source Sans Pro", "Work Sans", "Oswald", "Exo 2", "Fira Sans",
+  "Josefin Sans", "Quicksand", "Varela Round",
+  "Merriweather", "Playfair Display", "Libre Baskerville", "EB Garamond",
+  "Cormorant Garamond", "Lora", "Crimson Text",
+  "Pacifico", "Lobster", "Dancing Script", "Sacramento", "Caveat",
+  "Satisfy", "Indie Flower", "Permanent Marker", "Shadows Into Light",
+  "Architects Daughter", "Amatic SC", "Comfortaa",
+  "Bebas Neue", "Righteous", "Russo One", "Staatliches", "Teko",
+  "Cinzel", "Uncial Antiqua", "MedievalSharp", "Pirata One",
+  "Source Code Pro", "Fira Code", "Inconsolata", "Space Mono",
+  "VT323", "Press Start 2P", "Bungee", "Orbitron",
+];
+
+function loadGoogleFont(name) {
+  const id = `gf-${name.replace(/\s+/g, "-")}`;
+  if (document.getElementById(id)) return;
+  const link = document.createElement("link");
+  link.id = id;
+  link.rel = "stylesheet";
+  link.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(name)}&display=swap`;
+  document.head.appendChild(link);
 }
 
 // ─── Format menu ───
 
+const COLOR_PALETTE = [
+  "#ef4444","#f97316","#f59e0b","#eab308","#84cc16",
+  "#22c55e","#10b981","#06b6d4","#3b82f6","#6366f1",
+  "#8b5cf6","#ec4899","#ffffff","#d1d5db","#9ca3af",
+  "#6b7280","#374151","#1f2937","#000000","custom",
+];
+
+let _pendingColorRange = null;
+
 function initFormatMenu() {
   if (document.getElementById("fmt-menu")) return;
 
+  // ── Main bar ──
   const menu = document.createElement("div");
   menu.id = "fmt-menu";
   menu.className = "fmt-menu";
   menu.style.display = "none";
   menu.innerHTML = `
-    <button class="fmt-btn" data-fmt="bold"    title="Bold"><b>B</b></button>
-    <button class="fmt-btn" data-fmt="underline" title="Underline"><u>U</u></button>
-    <button class="fmt-btn" data-fmt="strike"  title="Strikethrough"><s>S</s></button>
-    <button class="fmt-btn" data-fmt="mono"    title="Monospace">{ }</button>
+    <button class="fmt-btn" data-fmt="bold"      title="Bold"><b>B</b></button>
+    <button class="fmt-btn" data-fmt="underline"  title="Underline"><u>U</u></button>
+    <button class="fmt-btn" data-fmt="strike"     title="Strikethrough"><s>S</s></button>
+    <button class="fmt-btn" data-fmt="mono"       title="Monospace">{ }</button>
     <span class="fmt-sep"></span>
-    <button class="fmt-btn" data-fmt="rainbow" title="Rainbow">🌈</button>
-    <button class="fmt-btn" data-fmt="wave"    title="Wave">〰</button>
-    <button class="fmt-btn" data-fmt="type"    title="Typewriter">⌨</button>
+    <button class="fmt-btn" data-fmt="rainbow"    title="Rainbow">🌈</button>
+    <button class="fmt-btn" data-fmt="wave"       title="Wave">〰</button>
+    <button class="fmt-btn" data-fmt="type"       title="Typewriter">⌨</button>
+    <span class="fmt-sep"></span>
+    <button class="fmt-btn fmt-toggle" data-panel="color" title="Color">●</button>
+    <button class="fmt-btn fmt-toggle" data-panel="font"  title="Font & Size">Aa</button>
+    <span class="fmt-sep"></span>
+    <button class="fmt-btn" data-fmt="clear"      title="Clear styles">✕</button>
   `;
   document.body.appendChild(menu);
 
-  // Prevent mousedown from stealing selection focus
-  menu.addEventListener("mousedown", (e) => e.preventDefault());
-  menu.addEventListener("click", (e) => {
-    const btn = e.target.closest("[data-fmt]");
-    if (btn) applyFormat(btn.dataset.fmt);
+  // ── Sub-panel ──
+  const panel = document.createElement("div");
+  panel.id = "fmt-subpanel";
+  panel.className = "fmt-subpanel";
+  panel.style.display = "none";
+  document.body.appendChild(panel);
+
+  // ── Hidden native color input ──
+  const colorInput = document.createElement("input");
+  colorInput.type = "color";
+  colorInput.id = "custom-color-input";
+  colorInput.style.cssText = "position:fixed;opacity:0;width:0;height:0;pointer-events:none";
+  document.body.appendChild(colorInput);
+
+  colorInput.addEventListener("change", () => {
+    if (_pendingColorRange) {
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(_pendingColorRange);
+      _pendingColorRange = null;
+    }
+    applyFormat("color:" + colorInput.value);
   });
 
+  // Prevent ALL clicks on menu/panel from stealing selection
+  [menu, panel].forEach((el) =>
+    el.addEventListener("mousedown", (e) => e.preventDefault())
+  );
+
+  menu.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-fmt],[data-panel]");
+    if (!btn) return;
+
+    if (btn.dataset.panel) {
+      const alreadyOpen = panel.dataset.activePanel === btn.dataset.panel
+        && panel.style.display !== "none";
+      hideSubPanel();
+      if (!alreadyOpen) openSubPanel(btn.dataset.panel);
+      return;
+    }
+    hideSubPanel();
+    applyFormat(btn.dataset.fmt);
+  });
+
+  panel.addEventListener("click", (e) => {
+    // Color swatch
+    const swatch = e.target.closest("[data-color]");
+    if (swatch) {
+      const color = swatch.dataset.color;
+      if (color === "custom") {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount) _pendingColorRange = sel.getRangeAt(0).cloneRange();
+        hideSubPanel();
+        colorInput.click();
+      } else {
+        applyFormat("color:" + color);
+        hideSubPanel();
+      }
+      return;
+    }
+    // Font pick
+    const fontItem = e.target.closest("[data-font]");
+    if (fontItem) {
+      applyFormat("font:" + fontItem.dataset.font);
+      hideSubPanel();
+      return;
+    }
+    // Size
+    const sizeBtn = e.target.closest("[data-size]");
+    if (sizeBtn) {
+      applyFormat("size:" + sizeBtn.dataset.size);
+      hideSubPanel();
+    }
+  });
+
+  // Font search filter
+  panel.addEventListener("input", (e) => {
+    if (e.target.id !== "font-search") return;
+    const q = e.target.value.toLowerCase();
+    panel.querySelectorAll("[data-font]").forEach((el) => {
+      el.style.display = el.dataset.font.toLowerCase().includes(q) ? "" : "none";
+    });
+  });
+
+  // Position menu on selection change
   document.addEventListener("selectionchange", () => {
     const sel = window.getSelection();
     const inputEl = document.getElementById("chat-input");
@@ -1280,20 +1537,10 @@ function initFormatMenu() {
     }
     try {
       const range = sel.getRangeAt(0);
-      if (!inputEl.contains(range.commonAncestorContainer)) {
-        hideFmtMenu();
-        return;
-      }
+      if (!inputEl.contains(range.commonAncestorContainer)) { hideFmtMenu(); return; }
       const rect = range.getBoundingClientRect();
       if (!rect.width && !rect.height) { hideFmtMenu(); return; }
-
-      const menuW = menu.offsetWidth || 280;
-      const left = Math.max(8, Math.min(
-        rect.left + rect.width / 2 - menuW / 2,
-        window.innerWidth - menuW - 8
-      ));
-      menu.style.left = `${left}px`;
-      menu.style.top  = `${rect.top - 50 + window.scrollY}px`;
+      positionMenu(menu, rect);
       menu.style.display = "flex";
     } catch {
       hideFmtMenu();
@@ -1301,41 +1548,143 @@ function initFormatMenu() {
   });
 }
 
+function positionMenu(menu, anchorRect) {
+  const mw = menu.offsetWidth || 320;
+  const left = Math.max(8, Math.min(
+    anchorRect.left + anchorRect.width / 2 - mw / 2,
+    window.innerWidth - mw - 8
+  ));
+  menu.style.left = `${left}px`;
+  menu.style.top  = `${anchorRect.top - 52 + window.scrollY}px`;
+}
+
+function openSubPanel(type) {
+  const menu = document.getElementById("fmt-menu");
+  const panel = document.getElementById("fmt-subpanel");
+  if (!panel || !menu) return;
+
+  if (type === "color") {
+    panel.innerHTML = `
+      <div class="subpanel-title">Color</div>
+      <div class="color-grid">
+        ${COLOR_PALETTE.map((c) =>
+          c === "custom"
+            ? `<button class="color-swatch color-custom" data-color="custom" title="Custom">🎨</button>`
+            : `<button class="color-swatch" data-color="${c}" style="background:${c}" title="${c}"></button>`
+        ).join("")}
+      </div>
+    `;
+  } else if (type === "font") {
+    panel.innerHTML = `
+      <div class="subpanel-title">Size</div>
+      <div class="size-row">
+        <button class="fmt-btn size-btn" data-size="sm"  title="Small · 0.8em">S</button>
+        <button class="fmt-btn size-btn" data-size="lg"  title="Large · 1.3em">L</button>
+        <button class="fmt-btn size-btn" data-size="xl"  title="X-Large · 1.85em">XL</button>
+        <button class="fmt-btn size-btn" data-size="xxl" title="Huge · 2.5em">XXL</button>
+      </div>
+      <div class="subpanel-title" style="margin-top:10px">Font</div>
+      <input id="font-search" class="font-search" placeholder="Search fonts..." />
+      <div class="font-list" id="font-list-scroller">
+        ${GOOGLE_FONTS.map((f) =>
+          `<div class="font-item" data-font="${escapeAttr(f)}" style="font-family:'${escapeAttr(f)}',sans-serif">${escapeHtml(f)}</div>`
+        ).join("")}
+      </div>
+    `;
+  }
+
+  panel.dataset.activePanel = type;
+  panel.style.display = "block";
+
+  // Lazy-load Google Fonts when items scroll into view
+  if (type === "font") {
+    const scroller = panel.querySelector("#font-list-scroller");
+    if (scroller && "IntersectionObserver" in window) {
+      const obs = new IntersectionObserver((entries) => {
+        entries.forEach((e) => {
+          if (e.isIntersecting) {
+            loadGoogleFont(e.target.dataset.font);
+            obs.unobserve(e.target);
+          }
+        });
+      }, { root: scroller, rootMargin: "80px" });
+      scroller.querySelectorAll("[data-font]").forEach((el) => obs.observe(el));
+    }
+  }
+
+  // Position above the format bar
+  const mr = menu.getBoundingClientRect();
+  const ph = panel.offsetHeight;
+  const pw = panel.offsetWidth || 240;
+  const left = Math.max(8, Math.min(mr.left, window.innerWidth - pw - 8));
+  panel.style.left = `${left}px`;
+  panel.style.top  = `${mr.top - ph - 6 + window.scrollY}px`;
+}
+
+function hideSubPanel() {
+  const panel = document.getElementById("fmt-subpanel");
+  if (panel) { panel.style.display = "none"; panel.dataset.activePanel = ""; }
+}
+
 function hideFmtMenu() {
+  hideSubPanel();
   const menu = document.getElementById("fmt-menu");
   if (menu) menu.style.display = "none";
 }
 
 function applyFormat(fmt) {
+  if (fmt === "clear") {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return;
+    const text = sel.toString();
+    if (!text) return;
+    // execCommand handles cross-span selections correctly in contenteditable
+    document.execCommand("insertText", false, text);
+    // Remove any empty styled nodes left behind
+    document.getElementById("chat-input")
+      ?.querySelectorAll("span:empty, strong:empty, b:empty, s:empty, code:empty")
+      .forEach((n) => n.remove());
+    hideFmtMenu();
+    document.getElementById("chat-input")?.focus();
+    return;
+  }
+
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || !sel.rangeCount) return;
-
   const selectedText = sel.toString();
   if (!selectedText) return;
-
   const range = sel.getRangeAt(0);
 
   let node;
   if (fmt === "bold") {
     node = document.createElement("strong");
     node.dataset.style = "bold";
+    node.style.fontWeight = "bold";
   } else {
     node = document.createElement("span");
     node.dataset.style = fmt;
   }
-  node.textContent = selectedText;
-
-  // Visual preview styles inside the composer
-  switch (fmt) {
-    case "underline": node.style.textDecoration = "underline"; break;
-    case "strike":    node.style.textDecoration = "line-through"; break;
-    case "mono":      node.style.fontFamily = "monospace"; node.style.fontSize = "0.9em"; break;
-    case "rainbow":   node.classList.add("text-rainbow"); break;
-    case "wave":      node.style.color = "var(--accent)"; node.style.borderBottom = "2px dotted var(--accent)"; break;
-    case "type":      node.style.borderBottom = "1px dashed var(--text-muted)"; break;
+  // Composer preview
+  if (fmt === "underline") node.style.textDecoration = "underline";
+  else if (fmt === "strike") node.style.textDecoration = "line-through";
+  else if (fmt === "mono") { node.style.fontFamily = "monospace"; node.style.fontSize = "0.9em"; }
+  else if (fmt === "rainbow") node.classList.add("text-rainbow");
+  else if (fmt === "wave") { node.style.color = "var(--accent)"; node.style.borderBottom = "2px dotted var(--accent)"; }
+  else if (fmt === "type") node.style.borderBottom = "1px dashed var(--text-muted)";
+  else if (fmt.startsWith("color:")) node.style.color = fmt.slice(6);
+  else if (fmt.startsWith("font:")) {
+    const font = fmt.slice(5);
+    loadGoogleFont(font);
+    node.style.fontFamily = `'${font}', sans-serif`;
+  }
+  else if (fmt.startsWith("size:")) {
+    const sizes = { sm: "0.8em", lg: "1.3em", xl: "1.85em", xxl: "2.5em" };
+    node.style.fontSize = sizes[fmt.slice(5)] || "1em";
   }
 
-  range.deleteContents();
+  // extractContents preserves inner HTML (nested colors, bold, etc.)
+  const fragment = range.extractContents();
+  node.appendChild(fragment);
   range.insertNode(node);
   range.setStartAfter(node);
   range.setEndAfter(node);
@@ -1344,6 +1693,48 @@ function applyFormat(fmt) {
 
   hideFmtMenu();
   document.getElementById("chat-input")?.focus();
+}
+
+// ─── Message context menu ───
+
+function initMessageContextMenu() {
+  if (document.getElementById("msg-ctx-menu")) return;
+  const menu = document.createElement("div");
+  menu.id = "msg-ctx-menu";
+  menu.className = "msg-ctx-menu";
+  menu.style.display = "none";
+  document.body.appendChild(menu);
+
+  document.addEventListener("click", () => { menu.style.display = "none"; });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") menu.style.display = "none";
+  });
+  menu.addEventListener("click", (e) => {
+    const item = e.target.closest("[data-action]");
+    if (!item) return;
+    menu.style.display = "none";
+    const { action, msgId } = item.dataset;
+    if (action === "delete") {
+      sendWs({ type: "delete_message", chat_id: currentChatId, message_id: msgId });
+    } else if (action === "copy") {
+      const textEl = document.querySelector(`[data-message-id="${msgId}"] .message-text`);
+      if (textEl) navigator.clipboard.writeText(textEl.textContent).catch(() => {});
+    }
+  });
+}
+
+function showMsgCtxMenu(x, y, msgId, isMe) {
+  const menu = document.getElementById("msg-ctx-menu");
+  if (!menu) return;
+  menu.innerHTML = `
+    <div class="ctx-item" data-action="copy" data-msg-id="${escapeAttr(msgId)}">Copy text</div>
+    ${isMe ? `<div class="ctx-item ctx-danger" data-action="delete" data-msg-id="${escapeAttr(msgId)}">Delete for everyone</div>` : ""}
+  `;
+  menu.style.display = "block";
+  const mw = menu.offsetWidth || 180;
+  const mh = menu.offsetHeight || 70;
+  menu.style.left = `${Math.min(x, window.innerWidth  - mw - 8)}px`;
+  menu.style.top  = `${Math.min(y + window.scrollY, window.scrollY + window.innerHeight - mh - 8)}px`;
 }
 
 // ─── Helpers ───
@@ -1379,6 +1770,7 @@ function toast(msg) {
 // ─── Init ───
 
 initFormatMenu();
+initMessageContextMenu();
 
 window.addEventListener("auth:logout", () => {
   stopNotifPolling();

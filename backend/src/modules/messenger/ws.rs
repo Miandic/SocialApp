@@ -248,6 +248,49 @@ async fn handle_client_message(
             }
         }
 
+        WsClientMessage::DeleteMessage { chat_id, message_id } => {
+            if !MessengerRepo::is_chat_member(&state.db, chat_id, sender_id)
+                .await
+                .unwrap_or(false)
+            {
+                hub.send_to_user(
+                    sender_id,
+                    WsServerMessage::Error {
+                        message: "Not a member of this chat".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+
+            let deleted =
+                MessengerRepo::delete_message(&state.db, chat_id, message_id, sender_id)
+                    .await
+                    .unwrap_or(false);
+
+            if !deleted {
+                hub.send_to_user(
+                    sender_id,
+                    WsServerMessage::Error {
+                        message: "Message not found or permission denied".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+
+            let members = MessengerRepo::get_chat_members(&state.db, chat_id)
+                .await
+                .unwrap_or_default();
+            let member_ids: Vec<Uuid> = members.iter().map(|m| m.user_id).collect();
+
+            hub.send_to_users(
+                &member_ids,
+                WsServerMessage::MessageDeleted { chat_id, message_id },
+            )
+            .await;
+        }
+
         WsClientMessage::RequestKeyBundle { user_id } => {
             let bundle = MessengerRepo::get_key_bundle(&state.db, user_id).await;
             match bundle {

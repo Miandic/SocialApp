@@ -149,6 +149,24 @@ impl MessengerRepo {
         Ok(messages)
     }
 
+    /// Delete a message — only succeeds if `sender_id` matches the message author.
+    pub async fn delete_message(
+        pool: &PgPool,
+        chat_id: Uuid,
+        message_id: Uuid,
+        sender_id: Uuid,
+    ) -> AppResult<bool> {
+        let result = sqlx::query(
+            "DELETE FROM messages WHERE id = $1 AND chat_id = $2 AND sender_id = $3",
+        )
+        .bind(message_id)
+        .bind(chat_id)
+        .bind(sender_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn get_last_message(pool: &PgPool, chat_id: Uuid) -> AppResult<Option<MessageRow>> {
         let msg = sqlx::query_as::<_, MessageRow>(
             "SELECT * FROM messages WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 1",

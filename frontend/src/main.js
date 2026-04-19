@@ -1392,12 +1392,51 @@ function renderFileMessage(data) {
   </a>`;
 }
 
-function galleryColumns(count) {
-  if (count <= 3) return count;   // 1→1, 2→2, 3→3
-  if (count <= 4) return 2;       // 4→2×2
-  if (count <= 9) return 3;       // 5-9→3 cols
-  if (count <= 16) return 4;      // 10-16→4 cols
-  return 5;                       // 17-100→5 cols
+// DP layout: group items into rows so each row height stays near TARGET_H.
+// Returns [{height, items, ars}] — one entry per row.
+function computeGalleryLayout(items, totalWidth) {
+  const GAP     = 3;
+  const TARGET  = 170;
+  const MIN_H   = 60;
+  const MAX_H   = 280;
+  const MAX_ROW = 4;
+  const n = items.length;
+
+  const ars = items.map(it => (it.w > 0 && it.h > 0) ? it.w / it.h : 1);
+
+  const INF  = 1e18;
+  const dp   = new Float64Array(n + 1).fill(INF);
+  const from = new Int32Array(n + 1);
+  dp[0] = 0;
+
+  for (let i = 0; i < n; i++) {
+    if (dp[i] >= INF) continue;
+    let sumAr = 0;
+    for (let k = 1; k <= MAX_ROW && i + k <= n; k++) {
+      sumAr += ars[i + k - 1];
+      const avail  = totalWidth - (k - 1) * GAP;
+      const idealH = avail / sumAr;
+      if (idealH < MIN_H) break;               // too many items → too short
+      const h     = Math.min(MAX_H, idealH);
+      const cost  = dp[i] + (h !== idealH ? 1e6 : 0) + Math.abs(h - TARGET);
+      if (cost < dp[i + k]) { dp[i + k] = cost; from[i + k] = i; }
+    }
+  }
+
+  // Reconstruct row boundaries
+  const breaks = [];
+  for (let j = n; j > 0; j = from[j]) breaks.unshift(from[j]);
+  breaks.push(n);
+
+  return breaks.slice(0, -1).map((start, ri) => {
+    const end    = breaks[ri + 1];
+    const slice  = items.slice(start, end);
+    const arSlice = ars.slice(start, end);
+    const sumAr  = arSlice.reduce((s, a) => s + a, 0);
+    const avail  = totalWidth - (slice.length - 1) * GAP;
+    const h      = Math.min(MAX_H, Math.max(MIN_H, avail / sumAr));
+    return { height: Math.round(h), items: slice, ars: arSlice };
+  });
 }
 
 function renderGalleryMessage(data) {
@@ -1408,37 +1447,40 @@ function renderGalleryMessage(data) {
     ? `<div class="msg-gallery-caption">${renderRichText(data.caption)}</div>`
     : "";
 
-  // Single item: natural aspect-ratio render + optional caption
-  if (items.length === 1) {
-    return renderMediaMessage(items[0]) + captionHtml;
-  }
+  if (items.length === 1) return renderMediaMessage(items[0]) + captionHtml;
 
-  const cols = galleryColumns(items.length);
+  const TOTAL_W = 334;
+  const layout  = computeGalleryLayout(items, TOTAL_W);
 
-  const tilesHtml = items.map((item, idx) => {
-    const u    = escapeAttr(item.url);
-    const mime = escapeAttr(item.mime || "image/");
-    const th   = item.thumb ? escapeAttr(item.thumb) : "";
-    const bg   = th ? `background-image:url('${th}');` : "";
+  const rowsHtml = layout.map(({ height, items: row, ars }) =>
+    `<div class="gallery-row" style="height:${height}px">${
+      row.map((item, i) => {
+        const u    = escapeAttr(item.url);
+        const mime = escapeAttr(item.mime || "image/");
+        const th   = item.thumb ? escapeAttr(item.thumb) : "";
+        const bg   = th ? `background-image:url('${th}');` : "";
+        const ar   = ars[i].toFixed(4);
 
-    if (item.mime?.startsWith("video/")) {
-      if (item.gif_like) {
-        return `<div class="gallery-tile" data-url="${u}" data-mime="${mime}" data-thumb="${th}" data-idx="${idx}" style="${bg}">
-          <video class="gallery-tile-img" src="${u}" autoplay loop muted playsinline
-            onloadeddata="this.closest('.gallery-tile').classList.add('media-loaded')"></video>
+        if (item.mime?.startsWith("video/")) {
+          if (item.gif_like) {
+            return `<div class="gallery-tile" data-url="${u}" data-mime="${mime}" data-thumb="${th}" style="flex:${ar};${bg}">
+              <video class="gallery-tile-img" src="${u}" autoplay loop muted playsinline
+                onloadeddata="this.closest('.gallery-tile').classList.add('media-loaded')"></video>
+            </div>`;
+          }
+          return `<div class="gallery-tile gallery-tile-video" data-url="${u}" data-mime="${mime}" data-thumb="${th}" style="flex:${ar};${bg}">
+            <div class="msg-video-play">▶</div>
+          </div>`;
+        }
+        return `<div class="gallery-tile" data-url="${u}" data-mime="${mime}" data-thumb="${th}" style="flex:${ar};${bg}">
+          <img class="gallery-tile-img" src="${u}" alt="${escapeAttr(item.name || "")}" loading="lazy"
+            onload="this.closest('.gallery-tile').classList.add('media-loaded')" />
         </div>`;
-      }
-      return `<div class="gallery-tile gallery-tile-video" data-url="${u}" data-mime="${mime}" data-thumb="${th}" data-idx="${idx}" style="${bg}">
-        <div class="msg-video-play">▶</div>
-      </div>`;
-    }
-    return `<div class="gallery-tile" data-url="${u}" data-mime="${mime}" data-thumb="${th}" data-idx="${idx}" style="${bg}">
-      <img class="gallery-tile-img" src="${u}" alt="${escapeAttr(item.name || "")}" loading="lazy"
-        onload="this.closest('.gallery-tile').classList.add('media-loaded')" />
-    </div>`;
-  }).join("");
+      }).join("")
+    }</div>`
+  ).join("");
 
-  return `<div class="msg-gallery" data-cols="${cols}">${tilesHtml}</div>${captionHtml}`;
+  return `<div class="msg-gallery">${rowsHtml}</div>${captionHtml}`;
 }
 
 function formatFileSize(bytes) {

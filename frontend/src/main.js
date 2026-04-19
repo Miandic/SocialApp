@@ -7,6 +7,7 @@ let ws = null; // WebSocket connection
 let currentChatId = null; // currently open chat
 let lastReadByChat = {}; // { chatId: { userId: messageId } }
 let notifPollTimer = null;
+let pendingAttachments = []; // [{kind:"media"|"file", file, thumb, objectUrl}]
 
 const routes = {
   login: renderLogin,
@@ -865,6 +866,9 @@ async function openChat(chatId) {
     el.classList.toggle("chat-item-active", el.dataset.chatId === chatId);
   });
 
+  // Clear pending attachments from previous chat
+  clearPendingAttachments();
+
   const mainEl = document.getElementById("chat-main");
   mainEl.innerHTML = `
     <div class="chat-header" id="chat-header">Loading...</div>
@@ -872,10 +876,18 @@ async function openChat(chatId) {
       <div style="padding:20px;text-align:center;color:var(--text-muted)">Loading messages...</div>
     </div>
     <div id="typing-indicator" class="typing-indicator"></div>
+    <div id="pending-tray" class="pending-tray" style="display:none"></div>
     <form class="chat-input" id="chat-input-form">
+      <button class="attach-btn" type="button" id="attach-btn" title="Attach">📎</button>
       <div id="chat-input" class="chat-input-field" contenteditable="true" data-placeholder="Type a message..."></div>
       <button class="btn" type="submit">Send</button>
     </form>
+    <div class="attach-menu" id="attach-menu" style="display:none">
+      <button class="attach-item" id="attach-media-btn">📷 Photo / Video / GIF</button>
+      <button class="attach-item" id="attach-file-btn">📄 File</button>
+    </div>
+    <input type="file" id="media-file-input" accept="image/*,video/*" multiple style="display:none" />
+    <input type="file" id="raw-file-input" multiple style="display:none" />
   `;
 
   try {
@@ -928,10 +940,17 @@ async function openChat(chatId) {
     `;
   }
 
-  // Sender name → profile navigation
-  document.getElementById("chat-messages")?.addEventListener("click", (e) => {
+  // Media lightbox + sender profile navigation
+  const msgsEl = document.getElementById("chat-messages");
+  msgsEl?.addEventListener("click", (e) => {
+    const wrap = e.target.closest(".msg-media-wrap");
+    if (wrap) { openLightbox(wrap); return; }
     const sender = e.target.closest(".message-sender.user-link");
     if (sender) navigate("profile", { username: sender.dataset.user });
+  });
+  // Cached images fire onload before DOM insertion — mark already-complete ones
+  msgsEl?.querySelectorAll?.(".msg-media-img")?.forEach((img) => {
+    if (img.complete && img.naturalWidth) img.closest(".msg-media-wrap")?.classList.add("media-loaded");
   });
 
   // Right-click context menu on messages
@@ -944,6 +963,40 @@ async function openChat(chatId) {
 
   const inputEl = document.getElementById("chat-input");
 
+  // ── Attach menu ──
+  const attachBtn  = document.getElementById("attach-btn");
+  const attachMenu = document.getElementById("attach-menu");
+  const mediaInput = document.getElementById("media-file-input");
+  const fileInput  = document.getElementById("raw-file-input");
+
+  attachBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = attachMenu.style.display !== "none";
+    attachMenu.style.display = open ? "none" : "block";
+    if (!open) {
+      // Position above the attach button
+      const r = attachBtn.getBoundingClientRect();
+      const mh = attachMenu.offsetHeight || 90;
+      attachMenu.style.left = `${r.left}px`;
+      attachMenu.style.top  = `${r.top - mh - 6 + window.scrollY}px`;
+    }
+  });
+
+  document.addEventListener("click", () => { attachMenu.style.display = "none"; }, { once: false, capture: false });
+
+  document.getElementById("attach-media-btn").onclick = () => { attachMenu.style.display = "none"; mediaInput.click(); };
+  document.getElementById("attach-file-btn").onclick  = () => { attachMenu.style.display = "none"; fileInput.click(); };
+
+  mediaInput.addEventListener("change", async () => {
+    for (const f of Array.from(mediaInput.files)) await addMediaAttachment(f);
+    mediaInput.value = "";
+  });
+
+  fileInput.addEventListener("change", async () => {
+    for (const f of Array.from(fileInput.files)) addFileAttachment(f);
+    fileInput.value = "";
+  });
+
   // Strip formatting on paste — insert plain text only
   inputEl.addEventListener("paste", (e) => {
     e.preventDefault();
@@ -951,20 +1004,35 @@ async function openChat(chatId) {
     document.execCommand("insertText", false, text);
   });
 
-  document.getElementById("chat-input-form").onsubmit = (e) => {
+  document.getElementById("chat-input-form").onsubmit = async (e) => {
     e.preventDefault();
-    if (!inputEl.textContent.trim()) return;
+    const hasText = !!inputEl.textContent.trim();
+    const hasAttachments = pendingAttachments.length > 0;
+    if (!hasText && !hasAttachments) return;
 
-    sendWs({
-      type: "send_message",
-      chat_id: chatId,
-      encrypted_content: serializeRichText(inputEl),
-      nonce: "test-nonce",
-      message_type: "text",
-    });
+    // Send attachments first
+    if (hasAttachments) {
+      const btn = e.target.querySelector("[type=submit]");
+      if (btn) { btn.disabled = true; btn.textContent = "Uploading…"; }
+      const atts = [...pendingAttachments];
+      clearPendingAttachments();
+      for (const att of atts) await uploadAndSendAttachment(att, chatId);
+      if (btn) { btn.disabled = false; btn.textContent = "Send"; }
+    }
 
-    inputEl.innerHTML = "";
-    inputEl.style.height = "";
+    // Then send text if any
+    if (hasText) {
+      sendWs({
+        type: "send_message",
+        chat_id: chatId,
+        encrypted_content: serializeRichText(inputEl),
+        nonce: "test-nonce",
+        message_type: "text",
+      });
+      inputEl.innerHTML = "";
+      inputEl.style.height = "";
+    }
+
     inputEl.focus();
   };
 
@@ -1232,23 +1300,76 @@ function serializeRichText(el) {
 
 function extractPlainText(content) {
   try {
-    const spans = JSON.parse(content);
-    if (Array.isArray(spans)) return spans.map((s) => s.t).join("");
+    const parsed = JSON.parse(content);
+    if (parsed && !Array.isArray(parsed)) {
+      if (parsed._type === "media") return parsed.mime?.startsWith("video/") ? "🎥 Video" : "🖼️ Photo";
+      if (parsed._type === "file")  return `📎 ${parsed.name || "File"}`;
+    }
+    if (Array.isArray(parsed)) return parsed.map((s) => s.t).join("");
   } catch {}
   return content;
 }
 
 function renderRichText(content) {
   try {
-    const spans = JSON.parse(content);
-    if (!Array.isArray(spans)) return escapeHtml(content);
-    return spans.map(({ t, s }) => {
+    const parsed = JSON.parse(content);
+    if (parsed && !Array.isArray(parsed)) {
+      if (parsed._type === "media") return renderMediaMessage(parsed);
+      if (parsed._type === "file")  return renderFileMessage(parsed);
+      return escapeHtml(content);
+    }
+    if (!Array.isArray(parsed)) return escapeHtml(content);
+    return parsed.map(({ t, s }) => {
       if (!s) return escapeHtml(t).replace(/\n/g, "<br>");
       return applyStylesToHtml(t, Array.isArray(s) ? s : [s]);
     }).join("");
   } catch {
     return escapeHtml(content);
   }
+}
+
+function renderMediaMessage(data) {
+  const u    = escapeAttr(data.url);
+  const mime = escapeAttr(data.mime || "image/");
+  const th   = data.thumb ? escapeAttr(data.thumb) : "";
+  const ar   = (data.w && data.h) ? `aspect-ratio:${data.w}/${data.h};` : "";
+  const bg   = th ? `background-image:url('${th}');` : "";
+
+  if (data.mime?.startsWith("video/")) {
+    if (data.gif_like) {
+      return `<div class="msg-media-wrap msg-video-wrap msg-gif-wrap" data-url="${u}" data-mime="${mime}" data-thumb="${th}" style="${ar}">
+        <video class="msg-gif-video" src="${escapeAttr(data.url)}" autoplay loop muted playsinline></video>
+      </div>`;
+    }
+    return `<div class="msg-media-wrap msg-video-wrap" data-url="${u}" data-mime="${mime}" data-thumb="${th}" style="${ar}${bg}">
+      <div class="msg-video-play">▶</div>
+    </div>`;
+  }
+  // Image / GIF — background thumbnail fades out once real img loads
+  return `<div class="msg-media-wrap" data-url="${u}" data-mime="${mime}" data-thumb="${th}" style="${ar}${bg}">
+    <img class="msg-media-img" src="${escapeAttr(data.url)}" alt="${escapeAttr(data.name || "")}" loading="lazy"
+      onload="this.closest('.msg-media-wrap').classList.add('media-loaded')" />
+  </div>`;
+}
+
+function renderFileMessage(data) {
+  const ext  = (data.name || "file").split(".").pop().toUpperCase().slice(0, 6);
+  const size = formatFileSize(data.size);
+  return `<a class="msg-file" href="${escapeAttr(data.url)}" download="${escapeAttr(data.name || "file")}" target="_blank">
+    <div class="msg-file-icon">${escapeHtml(ext)}</div>
+    <div class="msg-file-info">
+      <div class="msg-file-name">${escapeHtml(data.name || "file")}</div>
+      <div class="msg-file-size">${size}</div>
+    </div>
+    <div class="msg-file-dl">↓</div>
+  </a>`;
+}
+
+function formatFileSize(bytes) {
+  if (!bytes) return "";
+  if (bytes < 1024)             return `${bytes} B`;
+  if (bytes < 1024 * 1024)      return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function applyStylesToHtml(text, styles) {
@@ -1695,6 +1816,86 @@ function applyFormat(fmt) {
   document.getElementById("chat-input")?.focus();
 }
 
+// ─── Lightbox / media gallery ───
+
+let lbItems = [];
+let lbIndex = 0;
+
+function initLightbox() {
+  if (document.getElementById("lightbox")) return;
+  const lb = document.createElement("div");
+  lb.id = "lightbox";
+  lb.className = "lightbox";
+  lb.innerHTML = `
+    <div class="lb-backdrop"></div>
+    <button class="lb-close" title="Close">×</button>
+    <button class="lb-nav lb-prev" title="Previous">‹</button>
+    <div class="lb-stage" id="lb-stage"></div>
+    <button class="lb-nav lb-next" title="Next">›</button>
+    <div class="lb-counter" id="lb-counter"></div>
+  `;
+  document.body.appendChild(lb);
+
+  lb.querySelector(".lb-backdrop").onclick = closeLightbox;
+  lb.querySelector(".lb-close").onclick    = closeLightbox;
+  lb.querySelector(".lb-prev").onclick = () => navigateLightbox(-1);
+  lb.querySelector(".lb-next").onclick = () => navigateLightbox(+1);
+
+  document.addEventListener("keydown", (e) => {
+    if (!document.getElementById("lightbox")?.classList.contains("lb-open")) return;
+    if (e.key === "Escape")      closeLightbox();
+    if (e.key === "ArrowLeft")   navigateLightbox(-1);
+    if (e.key === "ArrowRight")  navigateLightbox(+1);
+  });
+}
+
+function openLightbox(wrapEl) {
+  const all = Array.from(document.querySelectorAll("#chat-messages .msg-media-wrap[data-url]"));
+  lbItems = all.map((el) => ({ url: el.dataset.url, mime: el.dataset.mime || "image/", thumb: el.dataset.thumb || "" }));
+  lbIndex = Math.max(0, all.indexOf(wrapEl));
+  const lb = document.getElementById("lightbox");
+  lb.classList.add("lb-open");
+  document.body.style.overflow = "hidden";
+  renderLbItem();
+}
+
+function closeLightbox() {
+  const lb = document.getElementById("lightbox");
+  lb?.classList.remove("lb-open");
+  lb?.querySelector("video")?.pause();
+  document.body.style.overflow = "";
+}
+
+function navigateLightbox(dir) {
+  if (!lbItems.length) return;
+  document.getElementById("lightbox")?.querySelector("video")?.pause();
+  lbIndex = (lbIndex + dir + lbItems.length) % lbItems.length;
+  renderLbItem();
+}
+
+function renderLbItem() {
+  const stage   = document.getElementById("lb-stage");
+  const counter = document.getElementById("lb-counter");
+  if (!stage || !lbItems.length) return;
+
+  const item = lbItems[lbIndex];
+  const lb   = document.getElementById("lightbox");
+
+  if (item.mime.startsWith("video/")) {
+    stage.innerHTML = `<video class="lb-video" src="${escapeAttr(item.url)}" controls autoplay playsinline></video>`;
+  } else {
+    stage.innerHTML = `
+      ${item.thumb ? `<img class="lb-img-placeholder" src="${escapeAttr(item.thumb)}" alt="" />` : ""}
+      <img class="lb-img" src="${escapeAttr(item.url)}" alt=""
+        onload="this.previousElementSibling && this.previousElementSibling.remove()" />`;
+  }
+
+  counter.textContent = lbItems.length > 1 ? `${lbIndex + 1} / ${lbItems.length}` : "";
+  const multi = lbItems.length > 1;
+  lb.querySelector(".lb-prev").style.display = multi ? "" : "none";
+  lb.querySelector(".lb-next").style.display = multi ? "" : "none";
+}
+
 // ─── Message context menu ───
 
 function initMessageContextMenu() {
@@ -1737,6 +1938,187 @@ function showMsgCtxMenu(x, y, msgId, isMe) {
   menu.style.top  = `${Math.min(y + window.scrollY, window.scrollY + window.innerHeight - mh - 8)}px`;
 }
 
+// ─── Media attachment helpers ───
+
+function clearPendingAttachments() {
+  pendingAttachments.forEach((a) => { if (a.objectUrl) URL.revokeObjectURL(a.objectUrl); });
+  pendingAttachments = [];
+  const tray = document.getElementById("pending-tray");
+  if (tray) { tray.style.display = "none"; tray.innerHTML = ""; }
+}
+
+async function addMediaAttachment(file) {
+  const objectUrl = URL.createObjectURL(file);
+  let thumb = null, w = 0, h = 0;
+  let gifLike = false;
+  if (file.type.startsWith("video/")) {
+    const r = await generateVideoThumbnail(file);
+    thumb = r.thumb; w = r.w; h = r.h;
+    if (file.size < 5 * 1024 * 1024) gifLike = await isVideoSilent(file);
+  } else if (file.type.startsWith("image/")) {
+    thumb = await generateThumbnail(file, 80);
+    const d = await getImageDimensions(file);
+    w = d.w; h = d.h;
+  }
+  pendingAttachments.push({ kind: "media", file, thumb, objectUrl, w, h, gifLike });
+  renderPendingTray();
+}
+
+function addFileAttachment(file) {
+  pendingAttachments.push({ kind: "file", file, thumb: null, objectUrl: null });
+  renderPendingTray();
+}
+
+function renderPendingTray() {
+  const tray = document.getElementById("pending-tray");
+  if (!tray) return;
+  if (pendingAttachments.length === 0) { tray.style.display = "none"; tray.innerHTML = ""; return; }
+  tray.style.display = "flex";
+  tray.innerHTML = pendingAttachments.map((att, i) => {
+    if (att.kind === "media") {
+      const preview = att.thumb
+        ? `<img class="pending-thumb-img" src="${att.thumb}" alt="" />`
+        : `<div class="pending-thumb-icon">${att.file.type.startsWith("video/") ? "🎥" : "🖼️"}</div>`;
+      return `<div class="pending-att" data-idx="${i}">${preview}<button class="pending-remove" data-idx="${i}">×</button></div>`;
+    }
+    return `<div class="pending-att pending-att-file" data-idx="${i}">
+      <div class="pending-att-name">${escapeHtml(att.file.name)}</div>
+      <div class="pending-att-size">${formatFileSize(att.file.size)}</div>
+      <button class="pending-remove" data-idx="${i}">×</button>
+    </div>`;
+  }).join("");
+  tray.querySelectorAll(".pending-remove").forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const idx = Number(btn.dataset.idx);
+      if (pendingAttachments[idx]?.objectUrl) URL.revokeObjectURL(pendingAttachments[idx].objectUrl);
+      pendingAttachments.splice(idx, 1);
+      renderPendingTray();
+    };
+  });
+}
+
+async function uploadAndSendAttachment(att, chatId) {
+  try {
+    let uploadFile = att.file;
+    if (att.kind === "media" && att.file.type.startsWith("image/")) {
+      uploadFile = await compressImage(att.file);
+    }
+    const results = await media.upload([uploadFile]);
+    if (!results?.[0]) throw new Error("Upload failed");
+    const { url } = results[0];
+
+    const payload = att.kind === "media"
+      ? JSON.stringify({ _type: "media", url, thumb: att.thumb, mime: att.file.type, name: att.file.name, size: uploadFile.size, w: att.w || 0, h: att.h || 0, gif_like: att.gifLike || false })
+      : JSON.stringify({ _type: "file",  url, name: att.file.name, size: att.file.size, mime: att.file.type });
+
+    sendWs({ type: "send_message", chat_id: chatId, encrypted_content: payload, nonce: "media-nonce", message_type: att.kind });
+  } catch (err) {
+    toast(`Upload failed: ${err.message || "unknown error"}`);
+  }
+}
+
+async function compressImage(file, maxDim = 1920, quality = 0.92) {
+  if (file.type === "image/gif" || file.size <= 5 * 1024 * 1024) return file;
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(maxDim / img.naturalWidth, maxDim / img.naturalHeight, 1);
+      const w = Math.round(img.naturalWidth  * scale);
+      const h = Math.round(img.naturalHeight * scale);
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      canvas.toBlob((blob) => resolve(blob || file), "image/jpeg", quality);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
+}
+
+async function generateThumbnail(file, size = 80) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(size / img.naturalWidth, size / img.naturalHeight);
+      const w = Math.round(img.naturalWidth  * scale);
+      const h = Math.round(img.naturalHeight * scale);
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL("image/jpeg", 0.5));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  });
+}
+
+async function isVideoSilent(file) {
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let decoded;
+    try {
+      decoded = await audioCtx.decodeAudioData(arrayBuffer);
+    } catch {
+      audioCtx.close();
+      return true; // нет аудиодорожки или не декодируется → тихое
+    }
+    audioCtx.close();
+    for (let c = 0; c < decoded.numberOfChannels; c++) {
+      const data = decoded.getChannelData(c);
+      for (let i = 0; i < data.length; i += 256) {
+        if (Math.abs(data[i]) > 0.001) return false; // есть реальный звук
+      }
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+async function generateVideoThumbnail(file) {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    const url = URL.createObjectURL(file);
+
+    const capture = () => {
+      const vw = video.videoWidth  || 160;
+      const vh = video.videoHeight || 90;
+      const scale = Math.min(320 / vw, 320 / vh, 1);
+      const tw = Math.round(vw * scale);
+      const th = Math.round(vh * scale);
+      const canvas = document.createElement("canvas");
+      canvas.width = tw; canvas.height = th;
+      canvas.getContext("2d").drawImage(video, 0, 0, tw, th);
+      URL.revokeObjectURL(url);
+      resolve({ thumb: canvas.toDataURL("image/jpeg", 0.7), w: vw, h: vh });
+    };
+
+    video.addEventListener("seeked", capture, { once: true });
+    video.onerror = () => { URL.revokeObjectURL(url); resolve({ thumb: null, w: 0, h: 0 }); };
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "metadata";
+    video.src = url;
+    video.addEventListener("loadedmetadata", () => { video.currentTime = 0.1; }, { once: true });
+  });
+}
+
+async function getImageDimensions(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); resolve({ w: img.naturalWidth, h: img.naturalHeight }); };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve({ w: 0, h: 0 }); };
+    img.src = url;
+  });
+}
+
 // ─── Helpers ───
 
 function escapeHtml(str) {
@@ -1771,6 +2153,7 @@ function toast(msg) {
 
 initFormatMenu();
 initMessageContextMenu();
+initLightbox();
 
 window.addEventListener("auth:logout", () => {
   stopNotifPolling();

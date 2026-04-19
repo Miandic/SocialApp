@@ -31,6 +31,7 @@ impl MediaService {
 
     pub async fn upload(
         client: &S3Client,
+        endpoint: &str,
         bucket: &str,
         content_type: &str,
         data: Vec<u8>,
@@ -42,10 +43,17 @@ impl MediaService {
             "image/webp" => "webp",
             "video/mp4" => "mp4",
             "video/webm" => "webm",
+            "video/quicktime" => "mov",
+            "application/pdf" => "pdf",
+            "application/zip" => "zip",
+            "application/x-zip-compressed" => "zip",
+            "audio/mpeg" => "mp3",
+            "audio/ogg" => "ogg",
+            "text/plain" => "txt",
             _ => "bin",
         };
 
-        let key = format!("uploads/{}/{}.{}", Uuid::new_v4(), Uuid::new_v4(), extension);
+        let key = format!("uploads/{}.{}", Uuid::new_v4(), extension);
 
         client
             .put_object()
@@ -57,7 +65,7 @@ impl MediaService {
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("S3 upload failed: {e}")))?;
 
-        let url = format!("{}/{}/{}", bucket, bucket, key);
+        let url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), bucket, key);
 
         Ok((url, key))
     }
@@ -67,6 +75,16 @@ impl MediaService {
         if !exists {
             let _ = client.create_bucket().bucket(bucket).send().await;
             tracing::info!("Created S3 bucket: {bucket}");
+        }
+
+        // Allow public read so browsers can load media directly
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::{}/*"]}}]}}"#,
+            bucket
+        );
+        match client.put_bucket_policy().bucket(bucket).policy(policy).send().await {
+            Ok(_)  => tracing::info!("Bucket '{bucket}' public-read policy set"),
+            Err(e) => tracing::warn!("Could not set bucket policy for '{bucket}': {e}"),
         }
     }
 }

@@ -6,6 +6,7 @@ mod modules;
 mod state;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -61,7 +62,8 @@ async fn main() {
         .nest("/api/posts", modules::posts::router())
         .nest("/api/messenger", modules::messenger::router())
         .nest("/api/notifications", modules::notifications::router())
-        .nest("/api/media", modules::media::router())
+        .nest("/api/media", modules::media::router()
+            .layer(DefaultBodyLimit::max(200 * 1024 * 1024)))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

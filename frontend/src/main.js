@@ -943,6 +943,8 @@ async function openChat(chatId) {
   // Media lightbox + sender profile navigation
   const msgsEl = document.getElementById("chat-messages");
   msgsEl?.addEventListener("click", (e) => {
+    const tile = e.target.closest(".gallery-tile[data-url]");
+    if (tile) { openGalleryLightbox(tile); return; }
     const wrap = e.target.closest(".msg-media-wrap");
     if (wrap) { openLightbox(wrap); return; }
     const sender = e.target.closest(".message-sender.user-link");
@@ -1010,27 +1012,32 @@ async function openChat(chatId) {
     const hasAttachments = pendingAttachments.length > 0;
     if (!hasText && !hasAttachments) return;
 
-    // Send attachments first
-    if (hasAttachments) {
-      const btn = e.target.querySelector("[type=submit]");
-      if (btn) { btn.disabled = true; btn.textContent = "Uploading…"; }
-      const atts = [...pendingAttachments];
-      clearPendingAttachments();
-      for (const att of atts) await uploadAndSendAttachment(att, chatId);
-      if (btn) { btn.disabled = false; btn.textContent = "Send"; }
-    }
+    const btn = e.target.querySelector("[type=submit]");
+    const mediaAtts = pendingAttachments.filter(a => a.kind === "media");
+    const fileAtts  = pendingAttachments.filter(a => a.kind === "file");
+    const richText  = hasText ? serializeRichText(inputEl) : null;
 
-    // Then send text if any
-    if (hasText) {
-      sendWs({
-        type: "send_message",
-        chat_id: chatId,
-        encrypted_content: serializeRichText(inputEl),
-        nonce: "test-nonce",
-        message_type: "text",
-      });
-      inputEl.innerHTML = "";
-      inputEl.style.height = "";
+    clearPendingAttachments();
+    if (hasText) { inputEl.innerHTML = ""; inputEl.style.height = ""; }
+
+    if (hasAttachments && btn) { btn.disabled = true; btn.textContent = "Uploading…"; }
+
+    try {
+      // File attachments always sent individually
+      for (const att of fileAtts) await uploadAndSendAttachment(att, chatId);
+
+      if (mediaAtts.length === 1 && !richText) {
+        // Single media, no caption → single-media message (existing behavior)
+        await uploadAndSendAttachment(mediaAtts[0], chatId);
+      } else if (mediaAtts.length > 0) {
+        // Multiple media, or media + caption → gallery message
+        await uploadAndSendGallery(mediaAtts, richText, chatId);
+      } else if (richText) {
+        // Text only
+        sendWs({ type: "send_message", chat_id: chatId, encrypted_content: richText, nonce: "text-" + Date.now(), message_type: "text" });
+      }
+    } finally {
+      if (hasAttachments && btn) { btn.disabled = false; btn.textContent = "Send"; }
     }
 
     inputEl.focus();
@@ -1314,8 +1321,9 @@ function renderRichText(content) {
   try {
     const parsed = JSON.parse(content);
     if (parsed && !Array.isArray(parsed)) {
-      if (parsed._type === "media") return renderMediaMessage(parsed);
-      if (parsed._type === "file")  return renderFileMessage(parsed);
+      if (parsed._type === "media")   return renderMediaMessage(parsed);
+      if (parsed._type === "gallery") return renderGalleryMessage(parsed);
+      if (parsed._type === "file")    return renderFileMessage(parsed);
       return escapeHtml(content);
     }
     if (!Array.isArray(parsed)) return escapeHtml(content);
@@ -1382,6 +1390,55 @@ function renderFileMessage(data) {
     </div>
     <div class="msg-file-dl">↓</div>
   </a>`;
+}
+
+function galleryColumns(count) {
+  if (count <= 3) return count;   // 1→1, 2→2, 3→3
+  if (count <= 4) return 2;       // 4→2×2
+  if (count <= 9) return 3;       // 5-9→3 cols
+  if (count <= 16) return 4;      // 10-16→4 cols
+  return 5;                       // 17-100→5 cols
+}
+
+function renderGalleryMessage(data) {
+  const items = data.items || [];
+  if (!items.length) return "";
+
+  const captionHtml = data.caption
+    ? `<div class="msg-gallery-caption">${renderRichText(data.caption)}</div>`
+    : "";
+
+  // Single item: natural aspect-ratio render + optional caption
+  if (items.length === 1) {
+    return renderMediaMessage(items[0]) + captionHtml;
+  }
+
+  const cols = galleryColumns(items.length);
+
+  const tilesHtml = items.map((item, idx) => {
+    const u    = escapeAttr(item.url);
+    const mime = escapeAttr(item.mime || "image/");
+    const th   = item.thumb ? escapeAttr(item.thumb) : "";
+    const bg   = th ? `background-image:url('${th}');` : "";
+
+    if (item.mime?.startsWith("video/")) {
+      if (item.gif_like) {
+        return `<div class="gallery-tile" data-url="${u}" data-mime="${mime}" data-thumb="${th}" data-idx="${idx}" style="${bg}">
+          <video class="gallery-tile-img" src="${u}" autoplay loop muted playsinline
+            onloadeddata="this.closest('.gallery-tile').classList.add('media-loaded')"></video>
+        </div>`;
+      }
+      return `<div class="gallery-tile gallery-tile-video" data-url="${u}" data-mime="${mime}" data-thumb="${th}" data-idx="${idx}" style="${bg}">
+        <div class="msg-video-play">▶</div>
+      </div>`;
+    }
+    return `<div class="gallery-tile" data-url="${u}" data-mime="${mime}" data-thumb="${th}" data-idx="${idx}" style="${bg}">
+      <img class="gallery-tile-img" src="${u}" alt="${escapeAttr(item.name || "")}" loading="lazy"
+        onload="this.closest('.gallery-tile').classList.add('media-loaded')" />
+    </div>`;
+  }).join("");
+
+  return `<div class="msg-gallery" data-cols="${cols}">${tilesHtml}</div>${captionHtml}`;
 }
 
 function formatFileSize(bytes) {
@@ -1938,6 +1995,17 @@ function openLightbox(wrapEl) {
   renderLbItem();
 }
 
+function openGalleryLightbox(tileEl) {
+  const galleryEl = tileEl.closest(".msg-gallery");
+  const all = Array.from(galleryEl.querySelectorAll(".gallery-tile[data-url]"));
+  lbItems = all.map(el => ({ url: el.dataset.url, mime: el.dataset.mime || "image/", thumb: el.dataset.thumb || "" }));
+  lbIndex = Math.max(0, all.indexOf(tileEl));
+  const lb = document.getElementById("lightbox");
+  lb.classList.add("lb-open");
+  document.body.style.overflow = "hidden";
+  renderLbItem();
+}
+
 function closeLightbox() {
   const lb = document.getElementById("lightbox");
   lb?.classList.remove("lb-open");
@@ -2092,6 +2160,32 @@ async function uploadAndSendAttachment(att, chatId) {
       : JSON.stringify({ _type: "file",  url, name: att.file.name, size: att.file.size, mime: att.file.type });
 
     sendWs({ type: "send_message", chat_id: chatId, encrypted_content: payload, nonce: "media-nonce", message_type: att.kind });
+  } catch (err) {
+    toast(`Upload failed: ${err.message || "unknown error"}`);
+  }
+}
+
+async function uploadAndSendGallery(mediaAtts, captionJson, chatId) {
+  try {
+    // Upload all media in parallel
+    const items = await Promise.all(mediaAtts.map(async (att) => {
+      let uploadFile = att.file;
+      if (att.file.type.startsWith("image/")) uploadFile = await compressImage(att.file);
+      const results = await media.upload([uploadFile]);
+      if (!results?.[0]) throw new Error("Upload failed");
+      return {
+        url:      results[0].url,
+        thumb:    att.thumb,
+        mime:     att.file.type,
+        name:     att.file.name,
+        size:     uploadFile.size,
+        w:        att.w      || 0,
+        h:        att.h      || 0,
+        gif_like: att.gifLike || false,
+      };
+    }));
+    const payload = JSON.stringify({ _type: "gallery", items, caption: captionJson ?? null });
+    sendWs({ type: "send_message", chat_id: chatId, encrypted_content: payload, nonce: "gallery-" + Date.now(), message_type: "media" });
   } catch (err) {
     toast(`Upload failed: ${err.message || "unknown error"}`);
   }

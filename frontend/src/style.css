@@ -1120,6 +1120,55 @@ input:focus, textarea:focus {
   pointer-events: none;
 }
 
+/* ─── Gallery mosaic ─── */
+.msg-gallery {
+  display: grid;
+  gap: 3px;
+  max-width: 340px;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.msg-gallery[data-cols="1"] { grid-template-columns: 1fr; }
+.msg-gallery[data-cols="2"] { grid-template-columns: 1fr 1fr; }
+.msg-gallery[data-cols="3"] { grid-template-columns: 1fr 1fr 1fr; }
+.msg-gallery[data-cols="4"] { grid-template-columns: repeat(4, 1fr); }
+.msg-gallery[data-cols="5"] { grid-template-columns: repeat(5, 1fr); }
+
+.gallery-tile {
+  aspect-ratio: 1;
+  overflow: hidden;
+  position: relative;
+  cursor: pointer;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-color: var(--border);
+}
+
+.gallery-tile-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 0.25s;
+}
+
+.gallery-tile.media-loaded .gallery-tile-img {
+  opacity: 1;
+}
+.gallery-tile.media-loaded {
+  background-image: none !important;
+  background-color: transparent;
+}
+
+.msg-gallery-caption {
+  margin-top: 5px;
+  font-size: 0.93em;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
 /* ─── Lightbox ─── */
 .lightbox {
   display: none;

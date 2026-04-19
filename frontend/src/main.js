@@ -1319,9 +1319,28 @@ function renderRichText(content) {
       return escapeHtml(content);
     }
     if (!Array.isArray(parsed)) return escapeHtml(content);
+
+    // When multiple spans share the 'type' effect, compute a single global
+    // ms-per-char so delays continue seamlessly across style boundaries
+    // (e.g. a rainbow+type word in the middle of a type-only sentence).
+    const typeItems = parsed.filter(({ s }) => {
+      const arr = s ? (Array.isArray(s) ? s : [s]) : [];
+      return arr.includes("type");
+    });
+    let globalMsPerChar = null;
+    if (typeItems.length > 1) {
+      const total = typeItems.reduce((n, { t }) => n + [...t].length, 0);
+      globalMsPerChar = Math.min(60, 1800 / Math.max(total, 1));
+    }
+
+    let typeOffset = 0;
     return parsed.map(({ t, s }) => {
       if (!s) return escapeHtml(t).replace(/\n/g, "<br>");
-      return applyStylesToHtml(t, Array.isArray(s) ? s : [s]);
+      const styles = Array.isArray(s) ? s : [s];
+      const hasType = styles.includes("type");
+      const html = applyStylesToHtml(t, styles, hasType ? typeOffset : 0, hasType ? globalMsPerChar : null);
+      if (hasType) typeOffset += [...t].length;
+      return html;
     }).join("");
   } catch {
     return escapeHtml(content);
@@ -1372,7 +1391,7 @@ function formatFileSize(bytes) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function applyStylesToHtml(text, styles) {
+function applyStylesToHtml(text, styles, typeOffset = 0, msPerChar = null) {
   const hasWave    = styles.includes("wave");
   const hasRainbow = styles.includes("rainbow");
   const hasType    = styles.includes("type");
@@ -1386,19 +1405,19 @@ function applyStylesToHtml(text, styles) {
   // Build per-char animated content
   let html;
   if (hasWave && hasRainbow && hasType) {
-    html = `<span class="text-wave-rainbow-type">${renderWaveRainbowTypeChars(text, decStyle)}</span>`;
+    html = `<span class="text-wave-rainbow-type">${renderWaveRainbowTypeChars(text, decStyle, typeOffset, msPerChar)}</span>`;
   } else if (hasWave && hasRainbow) {
     html = `<span class="text-wave-rainbow">${renderWaveRainbowChars(text, decStyle)}</span>`;
   } else if (hasWave && hasType) {
-    html = `<span class="text-wave-type">${renderWaveTypeChars(text, decStyle)}</span>`;
+    html = `<span class="text-wave-type">${renderWaveTypeChars(text, decStyle, typeOffset, msPerChar)}</span>`;
   } else if (hasRainbow && hasType) {
-    html = `<span class="text-rainbow-type">${renderRainbowTypeChars(text, decStyle)}</span>`;
+    html = `<span class="text-rainbow-type">${renderRainbowTypeChars(text, decStyle, typeOffset, msPerChar)}</span>`;
   } else if (hasWave) {
     html = `<span class="text-wave">${renderWaveChars(text, decStyle)}</span>`;
   } else if (hasRainbow) {
     html = `<span class="text-rainbow">${renderRainbowChars(text, decStyle)}</span>`;
   } else if (hasType) {
-    html = renderTypeChars(text, decStyle);
+    html = renderTypeChars(text, decStyle, typeOffset, msPerChar);
   } else {
     html = escapeHtml(text).replace(/\n/g, "<br>");
   }
@@ -1454,12 +1473,12 @@ function renderRainbowChars(text, extraStyle = "") {
     ).join("");
 }
 
-function renderTypeChars(text, extraStyle = "") {
+function renderTypeChars(text, extraStyle = "", startIdx = 0, msPerChar = null) {
   const chars = [...text];
-  const delay = Math.min(60, 1800 / Math.max(chars.length, 1));
+  const delay = msPerChar ?? Math.min(60, 1800 / Math.max(chars.length, 1));
   return chars
     .map((ch, i) =>
-      `<span class="type-char" style="animation-delay:${Math.round(i * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
+      `<span class="type-char" style="animation-delay:${Math.round((startIdx + i) * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
     ).join("");
 }
 
@@ -1471,33 +1490,33 @@ function renderWaveRainbowChars(text, extraStyle = "") {
     ).join("");
 }
 
-function renderWaveTypeChars(text, extraStyle = "") {
+function renderWaveTypeChars(text, extraStyle = "", startIdx = 0, msPerChar = null) {
   const chars = [...text];
-  const delay = Math.min(60, 1800 / Math.max(chars.length, 1));
+  const delay = msPerChar ?? Math.min(60, 1800 / Math.max(chars.length, 1));
   return chars
     .map((ch, i) =>
       ch === " " ? " "
-        : `<span style="--i:${i};--type-delay:${Math.round(i * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
+        : `<span style="--i:${i};--type-delay:${Math.round((startIdx + i) * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
     ).join("");
 }
 
-function renderRainbowTypeChars(text, extraStyle = "") {
+function renderRainbowTypeChars(text, extraStyle = "", startIdx = 0, msPerChar = null) {
   const chars = [...text];
-  const delay = Math.min(60, 1800 / Math.max(chars.length, 1));
+  const delay = msPerChar ?? Math.min(60, 1800 / Math.max(chars.length, 1));
   return chars
     .map((ch, i) =>
       ch === " " ? " "
-        : `<span style="--i:${i};--type-delay:${Math.round(i * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
+        : `<span style="--i:${i};--type-delay:${Math.round((startIdx + i) * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
     ).join("");
 }
 
-function renderWaveRainbowTypeChars(text, extraStyle = "") {
+function renderWaveRainbowTypeChars(text, extraStyle = "", startIdx = 0, msPerChar = null) {
   const chars = [...text];
-  const delay = Math.min(60, 1800 / Math.max(chars.length, 1));
+  const delay = msPerChar ?? Math.min(60, 1800 / Math.max(chars.length, 1));
   return chars
     .map((ch, i) =>
       ch === " " ? " "
-        : `<span style="--i:${i};--type-delay:${Math.round(i * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
+        : `<span style="--i:${i};--type-delay:${Math.round((startIdx + i) * delay)}ms;${extraStyle}">${escapeHtml(ch)}</span>`
     ).join("");
 }
 
@@ -1753,20 +1772,58 @@ function hideFmtMenu() {
   if (menu) menu.style.display = "none";
 }
 
+// Splits `parent` around `child` so that `child` ends up at `parent`'s level.
+// Siblings before child are kept in a cloned parent inserted before child;
+// siblings after child are kept in a cloned parent inserted after child.
+function splitParentAroundChild(parent, child) {
+  const gp = parent.parentNode;
+  const before = [];
+  const after  = [];
+  let cur = parent.firstChild;
+  while (cur && cur !== child) { before.push(cur); cur = cur.nextSibling; }
+  cur = child.nextSibling;
+  while (cur) { after.push(cur); cur = cur.nextSibling; }
+  if (before.length) {
+    const bClone = parent.cloneNode(false);
+    before.forEach(c => bClone.appendChild(c));
+    gp.insertBefore(bClone, parent);
+  }
+  gp.insertBefore(child, parent);
+  if (after.length) {
+    const aClone = parent.cloneNode(false);
+    after.forEach(c => aClone.appendChild(c));
+    gp.insertBefore(aClone, parent);
+  }
+  gp.removeChild(parent);
+}
+
 function applyFormat(fmt) {
+  const inputEl = document.getElementById("chat-input");
+
   if (fmt === "clear") {
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed) return;
     const text = sel.toString();
     if (!text) return;
-    // execCommand handles cross-span selections correctly in contenteditable
-    document.execCommand("insertText", false, text);
-    // Remove any empty styled nodes left behind
-    document.getElementById("chat-input")
-      ?.querySelectorAll("span:empty, strong:empty, b:empty, s:empty, code:empty")
-      .forEach((n) => n.remove());
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    const textNode = document.createTextNode(text);
+    range.insertNode(textNode);
+    // Lift the bare text node out of ALL ancestor formatting spans
+    let par = textNode.parentNode;
+    while (par && par !== inputEl) {
+      splitParentAroundChild(par, textNode);
+      par = textNode.parentNode;
+    }
+    inputEl?.querySelectorAll("span:empty,strong:empty,b:empty,s:empty,code:empty")
+      .forEach(n => n.remove());
+    const newRange = document.createRange();
+    newRange.setStartAfter(textNode);
+    newRange.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(newRange);
     hideFmtMenu();
-    document.getElementById("chat-input")?.focus();
+    inputEl?.focus();
     return;
   }
 
@@ -1789,7 +1846,13 @@ function applyFormat(fmt) {
   if (fmt === "underline") node.style.textDecoration = "underline";
   else if (fmt === "strike") node.style.textDecoration = "line-through";
   else if (fmt === "mono") { node.style.fontFamily = "monospace"; node.style.fontSize = "0.9em"; }
-  else if (fmt === "rainbow") node.classList.add("text-rainbow");
+  else if (fmt === "rainbow") {
+    node.classList.add("text-rainbow");
+    node.style.backgroundImage = "linear-gradient(90deg,#ff4444,#ff9900,#44cc44,#22aaff,#8844ff,#ff44bb)";
+    node.style.webkitBackgroundClip = "text";
+    node.style.backgroundClip = "text";
+    node.style.webkitTextFillColor = "transparent";
+  }
   else if (fmt === "wave") { node.style.color = "var(--accent)"; node.style.borderBottom = "2px dotted var(--accent)"; }
   else if (fmt === "type") node.style.borderBottom = "1px dashed var(--text-muted)";
   else if (fmt.startsWith("color:")) node.style.color = fmt.slice(6);
@@ -1807,13 +1870,29 @@ function applyFormat(fmt) {
   const fragment = range.extractContents();
   node.appendChild(fragment);
   range.insertNode(node);
+
+  // For size: lift the new node out of any ancestor size spans to prevent nesting.
+  // insertNode places the node inside whatever span the cursor was already in.
+  if (fmt.startsWith("size:")) {
+    let par = node.parentNode;
+    while (par && par !== inputEl) {
+      if (par.dataset?.style?.startsWith("size:")) {
+        splitParentAroundChild(par, node);
+        par = node.parentNode;
+      } else {
+        par = par.parentNode;
+      }
+    }
+    inputEl?.querySelectorAll('[data-style^="size:"]:empty').forEach(s => s.remove());
+  }
+
   range.setStartAfter(node);
   range.setEndAfter(node);
   sel.removeAllRanges();
   sel.addRange(range);
 
   hideFmtMenu();
-  document.getElementById("chat-input")?.focus();
+  inputEl?.focus();
 }
 
 // ─── Lightbox / media gallery ───

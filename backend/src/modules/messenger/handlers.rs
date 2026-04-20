@@ -28,7 +28,7 @@ pub async fn create_chat(
     if !is_group && req.member_ids.len() == 1 {
         let other_id = req.member_ids[0];
         if let Some(existing) = MessengerRepo::find_dm_chat(&state.db, user.user_id, other_id).await? {
-            let response = build_chat_response(&state, &existing).await?;
+            let response = build_chat_response(&state, &existing, user.user_id).await?;
             return Ok(Json(response));
         }
     }
@@ -49,7 +49,7 @@ pub async fn create_chat(
         }
     }
 
-    let response = build_chat_response(&state, &chat).await?;
+    let response = build_chat_response(&state, &chat, user.user_id).await?;
     Ok(Json(response))
 }
 
@@ -62,7 +62,7 @@ pub async fn list_chats(
 
     let mut responses = Vec::with_capacity(chats.len());
     for chat in &chats {
-        responses.push(build_chat_response(&state, chat).await?);
+        responses.push(build_chat_response(&state, chat, user.user_id).await?);
     }
     Ok(Json(responses))
 }
@@ -104,7 +104,7 @@ pub async fn get_messages(
 
 // ─── Helpers ───
 
-async fn build_chat_response(state: &AppState, chat: &ChatRow) -> AppResult<ChatResponse> {
+async fn build_chat_response(state: &AppState, chat: &ChatRow, user_id: Uuid) -> AppResult<ChatResponse> {
     let member_rows = MessengerRepo::get_chat_members(&state.db, chat.id).await?;
 
     let mut members = Vec::with_capacity(member_rows.len());
@@ -144,6 +144,8 @@ async fn build_chat_response(state: &AppState, chat: &ChatRow) -> AppResult<Chat
         None => None,
     };
 
+    let unread_count = MessengerRepo::get_unread_count(&state.db, chat.id, user_id).await?;
+
     Ok(ChatResponse {
         id: chat.id,
         name: chat.name.clone(),
@@ -151,5 +153,6 @@ async fn build_chat_response(state: &AppState, chat: &ChatRow) -> AppResult<Chat
         members,
         last_message,
         created_at: chat.created_at,
+        unread_count,
     })
 }

@@ -256,10 +256,40 @@ input:focus, textarea:focus {
   background: rgba(99, 102, 241, 0.15);
 }
 
+.chat-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
 .chat-name {
   font-weight: 600;
   font-size: 14px;
-  margin-bottom: 4px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unread-badge {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  padding: 0 5px;
+  margin-left: 6px;
+  flex-shrink: 0;
+}
+
+.unread-badge.visible {
+  display: inline-flex;
 }
 
 .chat-preview {
@@ -385,11 +415,17 @@ input:focus, textarea:focus {
   line-height: 1.4;
 }
 
+.message-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  margin-top: 4px;
+}
+
 .message-time {
   font-size: 11px;
   opacity: 0.6;
-  margin-top: 4px;
-  text-align: right;
 }
 
 /* ─── New chat dialog ─── */
@@ -578,12 +614,27 @@ input:focus, textarea:focus {
   text-decoration: underline;
 }
 
-/* ─── Read receipts ─── */
-.read-receipt {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 2px;
-  padding-right: 4px;
+/* ─── Message status dot ─── */
+.msg-status {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.3);
+  flex-shrink: 0;
+  display: none;
+}
+
+.msg-status.visible {
+  display: block;
+}
+
+.msg-status.read {
+  background: rgb(90, 255, 0);
+}
+
+/* ─── Grouped messages ─── */
+.message-grouped {
+  margin-top: -4px;
 }
 
 /* ─── Followers / following list ─── */

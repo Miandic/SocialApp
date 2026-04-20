@@ -23,6 +23,7 @@ const routes = {
 };
 
 function navigate(page, params = {}) {
+  currentChatId = null;
   window.__params = params;
   const main = document.getElementById("main");
   main.innerHTML = "";
@@ -169,6 +170,7 @@ function handleNewMessage(msg) {
   if (currentChatId === msg.chat_id) {
     appendMessage(msg);
     scrollMessagesDown();
+    updateReadReceipts();
     // Auto-mark read if chat is open and message isn't mine
     if (currentUser && msg.sender_id !== currentUser.id) {
       sendWs({ type: "mark_read", chat_id: msg.chat_id, message_id: msg.id });
@@ -180,6 +182,15 @@ function handleNewMessage(msg) {
     const preview = chatItem.querySelector(".chat-preview");
     if (preview) {
       preview.textContent = `${msg.sender_username}: ${extractPlainText(msg.encrypted_content)}`;
+    }
+    if (currentUser && msg.sender_id !== currentUser.id && msg.chat_id !== currentChatId) {
+      const badge = chatItem.querySelector(".unread-badge");
+      if (badge) {
+        const current = parseInt(badge.textContent) || 0;
+        const next = current + 1;
+        badge.textContent = next > 99 ? "99+" : next;
+        badge.classList.add("visible");
+      }
     }
   }
 }
@@ -217,20 +228,66 @@ function updateReadReceipts() {
   const messagesEl = document.getElementById("chat-messages");
   if (!messagesEl || !currentUser) return;
 
-  messagesEl.querySelectorAll(".read-receipt").forEach((el) => el.remove());
+  // Hide all dots first
+  messagesEl.querySelectorAll(".msg-status").forEach((el) => {
+    el.classList.remove("visible", "read");
+  });
 
+  const allMsgs = Array.from(messagesEl.querySelectorAll("[data-message-id]"));
+  const mineMsgs = allMsgs.filter((el) => el.classList.contains("message-mine"));
+  if (mineMsgs.length === 0) return;
+
+  // Find maxReadIndex across all other readers
   const readers = lastReadByChat[currentChatId] || {};
   const otherReaderIds = Object.keys(readers).filter((uid) => uid !== currentUser.id);
-  if (otherReaderIds.length === 0) return;
+  let maxReadIndex = -1;
+  for (const uid of otherReaderIds) {
+    const lastReadId = readers[uid];
+    if (!lastReadId) continue;
+    const idx = allMsgs.findIndex((el) => el.dataset.messageId === lastReadId);
+    if (idx === -1) { maxReadIndex = allMsgs.length - 1; break; }
+    if (idx > maxReadIndex) maxReadIndex = idx;
+  }
 
-  const myMsgs = Array.from(messagesEl.querySelectorAll(".message-mine"));
-  if (myMsgs.length === 0) return;
+  const lastMine = mineMsgs[mineMsgs.length - 1];
 
-  const lastMine = myMsgs[myMsgs.length - 1];
-  const receipt = document.createElement("div");
-  receipt.className = "read-receipt";
-  receipt.textContent = "Read";
-  lastMine.appendChild(receipt);
+  // Find last mine message whose position is <= maxReadIndex
+  let lastReadMine = null;
+  if (maxReadIndex >= 0) {
+    for (let i = mineMsgs.length - 1; i >= 0; i--) {
+      if (allMsgs.indexOf(mineMsgs[i]) <= maxReadIndex) {
+        lastReadMine = mineMsgs[i];
+        break;
+      }
+    }
+  }
+
+  if (lastReadMine === lastMine) {
+    // Last sent was read — green dot only
+    const dot = lastMine.querySelector(".msg-status");
+    if (dot) dot.classList.add("visible", "read");
+  } else {
+    // Grey dot on last sent
+    const greyDot = lastMine.querySelector(".msg-status");
+    if (greyDot) greyDot.classList.add("visible");
+    // Green dot on last read (if any)
+    if (lastReadMine) {
+      const greenDot = lastReadMine.querySelector(".msg-status");
+      if (greenDot) greenDot.classList.add("visible", "read");
+    }
+  }
+}
+
+function syncBadges(chats) {
+  for (const chat of chats) {
+    const item = document.querySelector(`[data-chat-id="${chat.id}"]`);
+    if (!item) continue;
+    const badge = item.querySelector(".unread-badge");
+    if (!badge) continue;
+    const unread = chat.id === currentChatId ? 0 : (chat.unread_count || 0);
+    badge.textContent = unread > 99 ? "99+" : unread;
+    badge.classList.toggle("visible", unread > 0);
+  }
 }
 
 // ─── Auth pages ───
@@ -836,9 +893,14 @@ async function loadChatList() {
         ? `${chat.last_message.sender_username}: ${extractPlainText(chat.last_message.encrypted_content)}`
         : "No messages yet";
       const active = currentChatId === chat.id ? " chat-item-active" : "";
+      const unread = chat.unread_count || 0;
+      const badgeHtml = `<span class="unread-badge${unread > 0 ? " visible" : ""}">${unread > 99 ? "99+" : unread}</span>`;
       return `
         <div class="chat-item${active}" data-chat-id="${chat.id}">
-          <div class="chat-name">${escapeHtml(name)}</div>
+          <div class="chat-item-row">
+            <div class="chat-name">${escapeHtml(name)}</div>
+            ${badgeHtml}
+          </div>
           <div class="chat-preview">${escapeHtml(preview)}</div>
         </div>
       `;
@@ -892,6 +954,7 @@ async function openChat(chatId) {
 
   try {
     const chats = await messenger.listChats();
+    syncBadges(chats);
     const chat = chats.find((c) => c.id === chatId);
 
     if (chat) {
@@ -924,7 +987,7 @@ async function openChat(chatId) {
       `;
     } else {
       const ordered = messages.slice().reverse();
-      messagesEl.innerHTML = ordered.map((m) => renderMessage(m)).join("");
+      messagesEl.innerHTML = ordered.map((m, i) => renderMessage(m, i > 0 ? ordered[i - 1] : null)).join("");
       scrollMessagesDown();
 
       // Mark the last message as read (if it's not mine)
@@ -1062,18 +1125,28 @@ async function openChat(chatId) {
   };
 }
 
-function renderMessage(msg) {
+function renderMessage(msg, prevMsg = null) {
   const isMe = currentUser && msg.sender_id === currentUser.id;
+  const isGrouped = prevMsg
+    && prevMsg.sender_id === msg.sender_id
+    && (new Date(msg.created_at) - new Date(prevMsg.created_at)) < 3 * 60 * 1000;
   const time = new Date(msg.created_at).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
   });
+  const statusHtml = isMe ? `<span class="msg-status"></span>` : "";
   return `
-    <div class="message ${isMe ? "message-mine" : "message-theirs"}" data-message-id="${msg.id}">
-      ${!isMe ? `<div class="message-sender user-link" data-user="${escapeAttr(msg.sender_username)}">${escapeHtml(msg.sender_username)}</div>` : ""}
+    <div class="message ${isMe ? "message-mine" : "message-theirs"}${isGrouped ? " message-grouped" : ""}"
+         data-message-id="${msg.id}"
+         data-sender-id="${escapeAttr(msg.sender_id)}"
+         data-created-at="${escapeAttr(msg.created_at)}">
+      ${!isGrouped && !isMe ? `<div class="message-sender user-link" data-user="${escapeAttr(msg.sender_username)}">${escapeHtml(msg.sender_username)}</div>` : ""}
       <div class="message-bubble ${isMe ? "bubble-mine" : "bubble-theirs"}">
         <div class="message-text">${renderRichText(msg.encrypted_content)}</div>
-        <div class="message-time">${time}</div>
+        <div class="message-meta">
+          <span class="message-time">${time}</span>
+          ${statusHtml}
+        </div>
       </div>
     </div>
   `;
@@ -1086,7 +1159,11 @@ function appendMessage(msg) {
   const placeholder = messagesEl.querySelector("[style*='text-align:center']");
   if (placeholder) placeholder.remove();
 
-  messagesEl.insertAdjacentHTML("beforeend", renderMessage(msg));
+  const allMsgEls = messagesEl.querySelectorAll("[data-message-id]");
+  const lastEl = allMsgEls[allMsgEls.length - 1];
+  const prevMsg = lastEl ? { sender_id: lastEl.dataset.senderId, created_at: lastEl.dataset.createdAt } : null;
+
+  messagesEl.insertAdjacentHTML("beforeend", renderMessage(msg, prevMsg));
 }
 
 function scrollMessagesDown() {
@@ -1311,6 +1388,12 @@ function extractPlainText(content) {
     if (parsed && !Array.isArray(parsed)) {
       if (parsed._type === "media") return parsed.mime?.startsWith("video/") ? "🎥 Video" : "🖼️ Photo";
       if (parsed._type === "file")  return `📎 ${parsed.name || "File"}`;
+      if (parsed._type === "gallery") {
+        const count = (parsed.items || []).length;
+        const label = `${count} photo${count !== 1 ? "s" : ""}`;
+        if (parsed.caption) return `${extractPlainText(parsed.caption)} [${label}]`;
+        return label;
+      }
     }
     if (Array.isArray(parsed)) return parsed.map((s) => s.t).join("");
   } catch {}

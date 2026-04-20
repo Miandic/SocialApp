@@ -107,6 +107,7 @@ pub struct ChatResponse {
     pub members: Vec<ChatMember>,
     pub last_message: Option<MessageResponse>,
     pub created_at: DateTime<Utc>,
+    pub unread_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,6 +147,7 @@ pub struct ChatMemberRow {
     pub user_id: Uuid,
     pub role: String,
     pub joined_at: DateTime<Utc>,
+    pub last_read_message_id: Option<Uuid>,
 }
 
 #[derive(Debug, sqlx::FromRow)]

@@ -204,6 +204,10 @@ async fn handle_client_message(
                 .await
                 .unwrap_or_default();
 
+            if let Err(e) = MessengerRepo::update_last_read(&state.db, chat_id, sender_id, message_id).await {
+                tracing::warn!("Failed to update last read: {e}");
+            }
+
             let other_ids: Vec<Uuid> = members
                 .iter()
                 .filter(|m| m.user_id != sender_id)

@@ -149,6 +149,45 @@ impl MessengerRepo {
         Ok(messages)
     }
 
+    pub async fn update_last_read(
+        pool: &PgPool,
+        chat_id: Uuid,
+        user_id: Uuid,
+        message_id: Uuid,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE chat_members SET last_read_message_id = $1 WHERE chat_id = $2 AND user_id = $3",
+        )
+        .bind(message_id)
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_unread_count(pool: &PgPool, chat_id: Uuid, user_id: Uuid) -> AppResult<i64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            WITH last_read AS (
+                SELECT m.created_at AS last_read_at
+                FROM chat_members cm
+                LEFT JOIN messages m ON m.id = cm.last_read_message_id
+                WHERE cm.chat_id = $1 AND cm.user_id = $2
+            )
+            SELECT COUNT(*) FROM messages msg
+            WHERE msg.chat_id = $1
+              AND msg.sender_id != $2
+              AND msg.created_at > COALESCE((SELECT last_read_at FROM last_read), '-infinity'::timestamptz)
+            "#,
+        )
+        .bind(chat_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+        Ok(count)
+    }
+
     /// Delete a message — only succeeds if `sender_id` matches the message author.
     pub async fn delete_message(
         pool: &PgPool,

@@ -148,6 +148,7 @@ pub struct ChatMemberRow {
     pub role: String,
     pub joined_at: DateTime<Utc>,
     pub last_read_message_id: Option<Uuid>,
+    pub last_read_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, sqlx::FromRow)]

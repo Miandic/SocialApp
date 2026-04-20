@@ -212,7 +212,7 @@ function handleMessageDeleted(msg) {
   const el = document.querySelector(`[data-message-id="${msg.message_id}"]`);
   if (el) {
     el.classList.add("message-deleting");
-    setTimeout(() => el.remove(), 280);
+    setTimeout(() => { el.remove(); updateReadReceipts(); }, 280);
   }
 }
 

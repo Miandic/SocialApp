@@ -156,7 +156,12 @@ impl MessengerRepo {
         message_id: Uuid,
     ) -> AppResult<()> {
         sqlx::query(
-            "UPDATE chat_members SET last_read_message_id = $1 WHERE chat_id = $2 AND user_id = $3",
+            r#"
+            UPDATE chat_members
+            SET last_read_message_id = $1,
+                last_read_at = (SELECT created_at FROM messages WHERE id = $1)
+            WHERE chat_id = $2 AND user_id = $3
+            "#,
         )
         .bind(message_id)
         .bind(chat_id)
@@ -169,16 +174,13 @@ impl MessengerRepo {
     pub async fn get_unread_count(pool: &PgPool, chat_id: Uuid, user_id: Uuid) -> AppResult<i64> {
         let count: i64 = sqlx::query_scalar(
             r#"
-            WITH last_read AS (
-                SELECT m.created_at AS last_read_at
-                FROM chat_members cm
-                LEFT JOIN messages m ON m.id = cm.last_read_message_id
-                WHERE cm.chat_id = $1 AND cm.user_id = $2
-            )
-            SELECT COUNT(*) FROM messages msg
-            WHERE msg.chat_id = $1
-              AND msg.sender_id != $2
-              AND msg.created_at > COALESCE((SELECT last_read_at FROM last_read), '-infinity'::timestamptz)
+            SELECT COUNT(*) FROM messages
+            WHERE chat_id = $1
+              AND sender_id != $2
+              AND created_at > COALESCE(
+                  (SELECT last_read_at FROM chat_members WHERE chat_id = $1 AND user_id = $2),
+                  '-infinity'::timestamptz
+              )
             "#,
         )
         .bind(chat_id)

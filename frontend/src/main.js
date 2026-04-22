@@ -942,6 +942,7 @@ async function openChat(chatId) {
     <form class="chat-input" id="chat-input-form">
       <button class="attach-btn" type="button" id="attach-btn" title="Attach">📎</button>
       <div id="chat-input" class="chat-input-field" contenteditable="true" data-placeholder="Type a message..."></div>
+      <button class="attach-btn emoji-btn" type="button" id="emoji-btn" title="Emoji"><img src="/emoji/apple/64/1f601.png" width="20" height="20" draggable="false" alt="😁"></button>
       <button class="btn" type="submit">Send</button>
     </form>
     <div class="attach-menu" id="attach-menu" style="display:none">
@@ -963,12 +964,14 @@ async function openChat(chatId) {
       const other = !chat.is_group
         ? chat.members.find((m) => m.user_id !== currentUser?.id)
         : null;
-      document.getElementById("chat-header").innerHTML = `
+      const chatHeaderEl = document.getElementById("chat-header");
+      chatHeaderEl.innerHTML = `
         ${other
           ? `<strong class="chat-header-link" data-username="${escapeAttr(other.username)}">${escapeHtml(name)}</strong>`
           : `<strong>${escapeHtml(name)}</strong>`}
         <span style="color:var(--text-muted);font-size:13px">${memberCount}</span>
       `;
+      applyAppleEmoji(chatHeaderEl);
       if (other) {
         document.querySelector(".chat-header-link")?.addEventListener("click", () => {
           navigate("profile", { username: other.username });
@@ -988,6 +991,7 @@ async function openChat(chatId) {
     } else {
       const ordered = messages.slice().reverse();
       messagesEl.innerHTML = ordered.map((m, i) => renderMessage(m, i > 0 ? ordered[i - 1] : null)).join("");
+      applyAppleEmoji(messagesEl);
       scrollMessagesDown();
 
       // Mark the last message as read (if it's not mine)
@@ -1052,6 +1056,9 @@ async function openChat(chatId) {
   document.getElementById("attach-media-btn").onclick = () => { attachMenu.style.display = "none"; mediaInput.click(); };
   document.getElementById("attach-file-btn").onclick  = () => { attachMenu.style.display = "none"; fileInput.click(); };
 
+  // ── Emoji picker ──
+  setupEmojiBtn();
+
   mediaInput.addEventListener("change", async () => {
     for (const f of Array.from(mediaInput.files)) await addMediaAttachment(f);
     mediaInput.value = "";
@@ -1107,6 +1114,12 @@ async function openChat(chatId) {
   };
 
   inputEl.addEventListener("keydown", (e) => {
+    // Backspace: undo emoji shortcode conversion if just converted
+    if (e.key === "Backspace" && _emojiLastConversion) {
+      if (undoEmojiConversion()) { e.preventDefault(); return; }
+    }
+    // Clear conversion state on any other key
+    if (e.key !== "Backspace") _emojiLastConversion = null;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       document.getElementById("chat-input-form").requestSubmit();
@@ -1115,6 +1128,10 @@ async function openChat(chatId) {
 
   let typingTimeout = null;
   inputEl.oninput = () => {
+    if (!_emojiConverting) {
+      _emojiLastConversion = null;        // clear on any manual input
+      tryEmojiShortcode(inputEl);         // try :shortcode: → 😀 conversion
+    }
     if (!typingTimeout) {
       sendWs({ type: "typing", chat_id: chatId });
     }
@@ -1164,6 +1181,8 @@ function appendMessage(msg) {
   const prevMsg = lastEl ? { sender_id: lastEl.dataset.senderId, created_at: lastEl.dataset.createdAt } : null;
 
   messagesEl.insertAdjacentHTML("beforeend", renderMessage(msg, prevMsg));
+  // Apply Apple emoji to the newly added message only
+  applyAppleEmoji(messagesEl.lastElementChild);
 }
 
 function scrollMessagesDown() {
@@ -2447,9 +2466,665 @@ function toast(msg) {
   setTimeout(() => el.remove(), 2800);
 }
 
+// ─── Emoji Picker ───
+
+// [emoji, name, category_idx, shortcode?]
+// 0=Smileys 1=People 2=Animals 3=Food 4=Travel 5=Activities 6=Objects 7=Symbols
+const _EMOJI_RAW = [
+  // ── Smileys & Emotion ──
+  ["😀","grinning face",0,"grinning"],["😃","grinning face with big eyes",0,"smiley"],
+  ["😄","grinning face with smiling eyes",0,"smile"],["😁","beaming face with smiling eyes",0,"grin"],
+  ["😆","grinning squinting face",0,"laughing"],["😅","grinning face with sweat",0,"sweat_smile"],
+  ["🤣","rolling on the floor laughing",0,"rofl"],["😂","face with tears of joy",0,"joy"],
+  ["🙂","slightly smiling face",0,"slightly_smiling_face"],["🙃","upside-down face",0,"upside_down_face"],
+  ["😉","winking face",0,"wink"],["😊","smiling face with smiling eyes",0,"blush"],
+  ["😇","smiling face with halo",0,"innocent"],["🥰","smiling face with hearts",0,"smiling_face_with_three_hearts"],
+  ["😍","smiling face with heart-eyes",0,"heart_eyes"],["🤩","star-struck",0,"star_struck"],
+  ["😘","face blowing a kiss",0,"kissing_heart"],["😗","kissing face",0,"kissing"],
+  ["😚","kissing face with closed eyes",0,"kissing_closed_eyes"],["😙","kissing face with smiling eyes",0,"kissing_smiling_eyes"],
+  ["🥲","smiling face with tear",0,"smiling_face_with_tear"],["😋","face savoring food",0,"yum"],
+  ["😛","face with tongue",0,"stuck_out_tongue"],["😜","winking face with tongue",0,"stuck_out_tongue_winking_eye"],
+  ["🤪","zany face",0,"zany_face"],["😝","squinting face with tongue",0,"stuck_out_tongue_closed_eyes"],
+  ["🤑","money-mouth face",0,"money_mouth_face"],["🤗","smiling face with open hands",0,"hugs"],
+  ["🤭","face with hand over mouth",0,"hand_over_mouth"],["🫢","face with open eyes and hand over mouth",0],
+  ["🫣","face with peeking eye",0],["🤫","shushing face",0,"shushing_face"],
+  ["🤔","thinking face",0,"thinking"],["🫡","saluting face",0,"saluting_face"],
+  ["🤐","zipper-mouth face",0,"zipper_mouth_face"],["🤨","face with raised eyebrow",0,"raised_eyebrow"],
+  ["😐","neutral face",0,"neutral_face"],["😑","expressionless face",0,"expressionless"],
+  ["😶","face without mouth",0,"no_mouth"],["🫥","dotted line face",0],
+  ["😏","smirking face",0,"smirk"],["😒","unamused face",0,"unamused"],
+  ["🙄","face with rolling eyes",0,"roll_eyes"],["😬","grimacing face",0,"grimacing"],
+  ["🤥","lying face",0,"lying_face"],["🫨","shaking face",0],
+  ["😌","relieved face",0,"relieved"],["😔","pensive face",0,"pensive"],
+  ["😪","sleepy face",0,"sleepy"],["🤤","drooling face",0,"drooling_face"],
+  ["😴","sleeping face",0,"sleeping"],["🥱","yawning face",0,"yawning_face"],
+  ["😷","face with medical mask",0,"mask"],["🤒","face with thermometer",0,"face_with_thermometer"],
+  ["🤕","face with head-bandage",0,"face_with_head_bandage"],["🤢","nauseated face",0,"nauseated_face"],
+  ["🤮","face vomiting",0,"face_vomiting"],["🤧","sneezing face",0,"sneezing_face"],
+  ["🥵","hot face",0,"hot_face"],["🥶","cold face",0,"cold_face"],
+  ["🥴","woozy face",0,"woozy_face"],["😵","face with crossed-out eyes",0,"dizzy_face"],
+  ["🤯","exploding head",0,"exploding_head"],["🤠","cowboy hat face",0,"cowboy_hat_face"],
+  ["🥳","partying face",0,"partying_face"],["🥸","disguised face",0,"disguised_face"],
+  ["😎","smiling face with sunglasses",0,"sunglasses"],["🤓","nerd face",0,"nerd_face"],
+  ["🧐","face with monocle",0,"monocle_face"],["😕","confused face",0,"confused"],
+  ["🫤","face with diagonal mouth",0],["😟","worried face",0,"worried"],
+  ["🙁","slightly frowning face",0,"slightly_frowning_face"],["☹️","frowning face",0,"frowning_face"],
+  ["😮","face with open mouth",0,"open_mouth"],["😯","hushed face",0,"hushed"],
+  ["😲","astonished face",0,"astonished"],["😳","flushed face",0,"flushed"],
+  ["🥺","pleading face",0,"pleading_face"],["🥹","face holding back tears",0],
+  ["😦","frowning face with open mouth",0,"frowning"],["😧","anguished face",0,"anguished"],
+  ["😨","fearful face",0,"fearful"],["😰","anxious face with sweat",0,"cold_sweat"],
+  ["😥","sad but relieved face",0,"disappointed_relieved"],["😢","crying face",0,"cry"],
+  ["😭","loudly crying face",0,"sob"],["😱","face screaming in fear",0,"scream"],
+  ["😖","confounded face",0,"confounded"],["😣","persevering face",0,"persevere"],
+  ["😞","disappointed face",0,"disappointed"],["😓","downcast face with sweat",0,"sweat"],
+  ["😩","weary face",0,"weary"],["😫","tired face",0,"tired_face"],
+  ["😤","face with steam from nose",0,"triumph"],["😡","enraged face",0,"rage"],
+  ["😠","angry face",0,"angry"],["🤬","face with symbols on mouth",0,"cursing_face"],
+  ["😈","smiling face with horns",0,"smiling_imp"],["👿","angry face with horns",0,"imp"],
+  ["💀","skull",0,"skull"],["☠️","skull and crossbones",0,"skull_crossbones"],
+  ["💩","pile of poo",0,"poop"],["🤡","clown face",0,"clown_face"],
+  ["👹","ogre",0,"japanese_ogre"],["👺","goblin",0,"japanese_goblin"],
+  ["👻","ghost",0,"ghost"],["👽","alien",0,"alien"],
+  ["👾","alien monster",0,"space_invader"],["🤖","robot",0,"robot"],
+  ["😺","grinning cat",0,"smiley_cat"],["😸","grinning cat with smiling eyes",0,"smile_cat"],
+  ["😹","cat with tears of joy",0,"joy_cat"],["😻","smiling cat with heart-eyes",0,"heart_eyes_cat"],
+  ["😼","cat with wry smile",0,"smirk_cat"],["😽","kissing cat",0,"kissing_cat"],
+  ["🙀","weary cat",0,"scream_cat"],["😿","crying cat",0,"crying_cat_face"],
+  ["😾","pouting cat",0,"pouting_cat"],
+  // Hearts & emotion symbols
+  ["❤️","red heart",0,"heart"],["🧡","orange heart",0,"orange_heart"],
+  ["💛","yellow heart",0,"yellow_heart"],["💚","green heart",0,"green_heart"],
+  ["💙","blue heart",0,"blue_heart"],["💜","purple heart",0,"purple_heart"],
+  ["🖤","black heart",0,"black_heart"],["🤍","white heart",0,"white_heart"],
+  ["🤎","brown heart",0,"brown_heart"],["💔","broken heart",0,"broken_heart"],
+  ["❤️‍🔥","heart on fire",0,"heart_on_fire"],["❤️‍🩹","mending heart",0,"mending_heart"],
+  ["❣️","heart exclamation",0,"heavy_heart_exclamation"],["💕","two hearts",0,"two_hearts"],
+  ["💞","revolving hearts",0,"revolving_hearts"],["💓","beating heart",0,"heartbeat"],
+  ["💗","growing heart",0,"heartpulse"],["💖","sparkling heart",0,"sparkling_heart"],
+  ["💘","heart with arrow",0,"cupid"],["💝","heart with ribbon",0,"gift_heart"],
+  ["💟","heart decoration",0,"heart_decoration"],["💋","kiss mark",0,"kiss"],
+  ["💌","love letter",0,"love_letter"],["💯","hundred points",0,"100"],
+  ["💢","anger symbol",0,"anger"],["💥","collision",0,"boom"],
+  ["💫","dizzy",0,"dizzy"],["💦","sweat droplets",0,"sweat_drops"],
+  ["💨","dashing away",0,"dash"],["💬","speech balloon",0,"speech_balloon"],
+  ["💭","thought balloon",0,"thought_balloon"],["🗯️","anger bubble",0,"anger_right"],
+  ["✨","sparkles",0,"sparkles"],["🔥","fire",0,"fire"],
+  ["🌟","glowing star",0,"star2"],["⭐","star",0,"star"],
+  // ── People & Body ──
+  ["👋","waving hand",1,"wave"],["🤚","raised back of hand",1,"raised_back_of_hand"],
+  ["🖐️","hand with fingers splayed",1,"raised_hand_with_fingers_splayed"],["✋","raised hand",1,"hand"],
+  ["🖖","vulcan salute",1,"vulcan_salute"],["🫱","rightwards hand",1],
+  ["🫲","leftwards hand",1],["🫳","palm down hand",1],["🫴","palm up hand",1],
+  ["👌","ok hand",1,"ok_hand"],["🤌","pinched fingers",1,"pinched_fingers"],
+  ["🤏","pinching hand",1,"pinching_hand"],["✌️","victory hand",1,"v"],
+  ["🤞","crossed fingers",1,"crossed_fingers"],["🫰","hand with index finger and thumb crossed",1],
+  ["🤟","love-you gesture",1,"love_you_gesture"],["🤘","sign of the horns",1,"metal"],
+  ["🤙","call me hand",1,"call_me_hand"],["🫵","index pointing at the viewer",1],
+  ["👈","backhand index pointing left",1,"point_left"],["👉","backhand index pointing right",1,"point_right"],
+  ["👆","backhand index pointing up",1,"point_up_2"],["🖕","middle finger",1,"middle_finger"],
+  ["👇","backhand index pointing down",1,"point_down"],["☝️","index pointing up",1,"point_up"],
+  ["👍","thumbs up",1,"thumbsup"],["👎","thumbs down",1,"thumbsdown"],
+  ["✊","raised fist",1,"fist_raised"],["👊","oncoming fist",1,"facepunch"],
+  ["🤛","left-facing fist",1,"fist_left"],["🤜","right-facing fist",1,"fist_right"],
+  ["👏","clapping hands",1,"clap"],["🙌","raising hands",1,"raised_hands"],
+  ["🫶","heart hands",1,"heart_hands"],["👐","open hands",1,"open_hands"],
+  ["🤲","palms up together",1,"palms_up_together"],["🤝","handshake",1,"handshake"],
+  ["🙏","folded hands",1,"pray"],["✍️","writing hand",1,"writing_hand"],
+  ["💅","nail polish",1,"nail_care"],["🤳","selfie",1,"selfie"],
+  ["💪","flexed biceps",1,"muscle"],["🦾","mechanical arm",1,"mechanical_arm"],
+  ["🦿","mechanical leg",1,"mechanical_leg"],["🦵","leg",1,"leg"],["🦶","foot",1,"foot"],
+  ["👂","ear",1,"ear"],["🦻","ear with hearing aid",1],["👃","nose",1,"nose"],
+  ["🫀","anatomical heart",1,"anatomical_heart"],["🫁","lungs",1,"lungs"],
+  ["🧠","brain",1,"brain"],["🦷","tooth",1,"tooth"],["🦴","bone",1,"bone"],
+  ["👀","eyes",1,"eyes"],["👁️","eye",1,"eye"],["👅","tongue",1,"tongue"],["👄","mouth",1,"lips"],
+  // People
+  ["👶","baby",1,"baby"],["🧒","child",1,"child"],["👦","boy",1,"boy"],["👧","girl",1,"girl"],
+  ["🧑","person",1,"person"],["👨","man",1,"man"],["👩","woman",1,"woman"],
+  ["🧓","older person",1],["👴","old man",1,"older_man"],["👵","old woman",1,"older_woman"],
+  ["👮","police officer",1,"cop"],["🕵️","detective",1,"detective"],
+  ["💂","guard",1,"guardsman"],["👷","construction worker",1,"construction_worker"],
+  ["🤴","prince",1,"prince"],["👸","princess",1,"princess"],
+  ["👳","person wearing turban",1,"man_with_turban"],["🧕","woman with headscarf",1,"woman_with_headscarf"],
+  ["🤵","person in tuxedo",1,"man_in_tuxedo"],["👰","person with veil",1,"bride_with_veil"],
+  ["🤰","pregnant woman",1,"pregnant_woman"],["🤱","breast-feeding",1,"breast_feeding"],
+  ["👼","baby angel",1,"angel"],["🎅","Santa Claus",1,"santa"],["🤶","Mrs. Claus",1,"mrs_claus"],
+  ["🦸","superhero",1,"superhero"],["🦹","supervillain",1,"supervillain"],
+  ["🧙","mage",1,"mage"],["🧝","elf",1,"elf"],["🧛","vampire",1,"vampire"],
+  ["🧟","zombie",1,"zombie"],["🧞","genie",1,"genie"],["🧜","merperson",1,"mermaid"],
+  ["🧚","fairy",1,"fairy"],["🙍","person frowning",1,"person_frowning"],
+  ["🙎","person pouting",1,"person_with_pouting_face"],["🙅","person gesturing NO",1,"no_good"],
+  ["🙆","person gesturing OK",1,"ok_woman"],["💁","person tipping hand",1,"information_desk_person"],
+  ["🙋","person raising hand",1,"raising_hand"],["🧏","deaf person",1,"deaf_person"],
+  ["🙇","person bowing",1,"bow"],["🤦","person facepalming",1,"facepalm"],
+  ["🤷","person shrugging",1,"shrug"],["💆","person getting massage",1,"massage"],
+  ["💇","person getting haircut",1,"haircut"],["🚶","person walking",1,"walking"],
+  ["🏃","person running",1,"runner"],["💃","woman dancing",1,"dancer"],
+  ["🕺","man dancing",1,"man_dancing"],["🧘","person in lotus position",1,"person_in_lotus_position"],
+  ["👫","woman and man holding hands",1,"couple"],["👬","men holding hands",1,"two_men_holding_hands"],
+  ["👭","women holding hands",1,"two_women_holding_hands"],["💏","kiss",1,"couplekiss"],
+  ["💑","couple with heart",1,"couple_with_heart"],["👨‍👩‍👦","family",1,"family"],
+  // ── Animals & Nature ──
+  ["🐶","dog face",2,"dog"],["🐱","cat face",2,"cat"],["🐭","mouse face",2,"mouse"],
+  ["🐹","hamster",2,"hamster"],["🐰","rabbit face",2,"rabbit"],["🦊","fox",2,"fox_face"],
+  ["🐻","bear",2,"bear"],["🐼","panda",2,"panda_face"],["🐨","koala",2,"koala"],
+  ["🐯","tiger face",2,"tiger"],["🦁","lion",2,"lion"],["🐮","cow face",2,"cow"],
+  ["🐷","pig face",2,"pig"],["🐸","frog",2,"frog"],["🐵","monkey face",2,"monkey_face"],
+  ["🙈","see-no-evil monkey",2,"see_no_evil"],["🙉","hear-no-evil monkey",2,"hear_no_evil"],
+  ["🙊","speak-no-evil monkey",2,"speak_no_evil"],["🐔","chicken",2,"chicken"],
+  ["🐧","penguin",2,"penguin"],["🐦","bird",2,"bird"],["🐤","baby chick",2,"baby_chick"],
+  ["🦆","duck",2,"duck"],["🦅","eagle",2,"eagle"],["🦉","owl",2,"owl"],["🦇","bat",2,"bat"],
+  ["🐺","wolf",2,"wolf"],["🐗","boar",2,"boar"],["🐴","horse face",2,"horse"],["🦄","unicorn",2,"unicorn"],
+  ["🐝","honeybee",2,"bee"],["🪱","worm",2,"worm"],["🐛","bug",2,"bug"],
+  ["🦋","butterfly",2,"butterfly"],["🐌","snail",2,"snail"],["🐞","lady beetle",2,"beetle"],
+  ["🐜","ant",2,"ant"],["🦟","mosquito",2,"mosquito"],["🦗","cricket",2,"cricket"],
+  ["🦂","scorpion",2,"scorpion"],["🐢","turtle",2,"turtle"],["🐍","snake",2,"snake"],
+  ["🦎","lizard",2,"lizard"],["🦖","T-Rex",2,"t-rex"],["🦕","sauropod",2,"sauropod"],
+  ["🐙","octopus",2,"octopus"],["🦑","squid",2,"squid"],["🦐","shrimp",2,"shrimp"],
+  ["🦞","lobster",2,"lobster"],["🦀","crab",2,"crab"],["🐡","blowfish",2,"blowfish"],
+  ["🐠","tropical fish",2,"tropical_fish"],["🐟","fish",2,"fish"],["🐬","dolphin",2,"dolphin"],
+  ["🐳","spouting whale",2,"whale"],["🦈","shark",2,"shark"],["🐊","crocodile",2,"crocodile"],
+  ["🐘","elephant",2,"elephant"],["🦛","hippopotamus",2,"hippopotamus"],
+  ["🦏","rhinoceros",2,"rhinoceros"],["🐪","camel",2,"dromedary_camel"],
+  ["🦒","giraffe",2,"giraffe"],["🦘","kangaroo",2,"kangaroo"],["🦬","bison",2,"bison"],
+  ["🐎","horse",2,"racehorse"],["🐑","ewe",2,"sheep"],["🦌","deer",2,"deer"],
+  ["🐕","dog",2,"dog2"],["🦮","guide dog",2,"guide_dog"],["🐈","cat",2,"cat2"],
+  ["🦤","dodo",2,"dodo"],["🦚","peacock",2,"peacock"],["🦜","parrot",2,"parrot"],
+  ["🦢","swan",2,"swan"],["🦩","flamingo",2,"flamingo"],["🕊️","dove",2,"dove"],
+  ["🐇","rabbit",2,"rabbit2"],["🦝","raccoon",2,"raccoon"],["🦨","skunk",2,"skunk"],
+  ["🦡","badger",2,"badger"],["🦦","otter",2,"otter"],["🦥","sloth",2,"sloth"],
+  ["🐿️","chipmunk",2,"chipmunk"],["🦔","hedgehog",2,"hedgehog"],
+  ["🦍","gorilla",2,"gorilla"],["🦧","orangutan",2,"orangutan"],
+  // Plants
+  ["🌵","cactus",2,"cactus"],["🎄","Christmas tree",2,"christmas_tree"],
+  ["🌲","evergreen tree",2,"evergreen_tree"],["🌳","deciduous tree",2,"deciduous_tree"],
+  ["🌴","palm tree",2,"palm_tree"],["🌱","seedling",2,"seedling"],["🌿","herb",2,"herb"],
+  ["☘️","shamrock",2,"shamrock"],["🍀","four leaf clover",2,"four_leaf_clover"],
+  ["🍃","leaves",2,"leaves"],["🍂","fallen leaf",2,"fallen_leaf"],["🍁","maple leaf",2,"maple_leaf"],
+  ["🌾","sheaf of rice",2,"ear_of_rice"],["🌺","hibiscus",2,"hibiscus"],
+  ["🌻","sunflower",2,"sunflower"],["🌹","rose",2,"rose"],["🥀","wilted flower",2,"wilted_flower"],
+  ["🌷","tulip",2,"tulip"],["🌼","blossom",2,"blossom"],["🌸","cherry blossom",2,"cherry_blossom"],
+  ["💐","bouquet",2,"bouquet"],["🍄","mushroom",2,"mushroom"],["🌰","chestnut",2,"chestnut"],
+  // Weather
+  ["🌊","water wave",2,"ocean"],["💧","droplet",2,"droplet"],["🌈","rainbow",2,"rainbow"],
+  ["⚡","lightning",2,"zap"],["❄️","snowflake",2,"snowflake"],["🌪️","tornado",2,"tornado"],
+  ["🌙","crescent moon",2,"crescent_moon"],["☀️","sun",2,"sunny"],["⛅","sun behind cloud",2,"partly_sunny"],
+  ["☁️","cloud",2,"cloud"],["🌧️","cloud with rain",2,"cloud_with_rain"],
+  ["⛈️","cloud with lightning and rain",2,"thunder_cloud_and_rain"],
+  ["🌨️","cloud with snow",2,"cloud_with_snow"],["⛄","snowman",2,"snowman"],
+  ["🌬️","wind face",2,"wind_face"],["🌀","cyclone",2,"cyclone"],["🌫️","fog",2],
+  // ── Food & Drink ──
+  ["🍎","red apple",3,"apple"],["🍊","tangerine",3,"tangerine"],["🍋","lemon",3,"lemon"],
+  ["🍌","banana",3,"banana"],["🍉","watermelon",3,"watermelon"],["🍇","grapes",3,"grapes"],
+  ["🍓","strawberry",3,"strawberry"],["🫐","blueberries",3,"blueberries"],
+  ["🍒","cherries",3,"cherries"],["🍑","peach",3,"peach"],["🥭","mango",3,"mango"],
+  ["🍍","pineapple",3,"pineapple"],["🥥","coconut",3,"coconut"],["🥝","kiwi fruit",3,"kiwi_fruit"],
+  ["🍅","tomato",3,"tomato"],["🫒","olive",3,"olive"],["🥑","avocado",3,"avocado"],
+  ["🍆","eggplant",3,"eggplant"],["🥦","broccoli",3,"broccoli"],["🥬","leafy green",3,"leafy_green"],
+  ["🥒","cucumber",3,"cucumber"],["🌶️","hot pepper",3,"hot_pepper"],
+  ["🫑","bell pepper",3,"bell_pepper"],["🧄","garlic",3,"garlic"],["🧅","onion",3,"onion"],
+  ["🥔","potato",3,"potato"],["🌽","ear of corn",3,"corn"],["🥐","croissant",3,"croissant"],
+  ["🥯","bagel",3,"bagel"],["🍞","bread",3,"bread"],["🥖","baguette bread",3,"baguette_bread"],
+  ["🥨","pretzel",3,"pretzel"],["🧀","cheese wedge",3,"cheese"],["🥚","egg",3,"egg"],
+  ["🍳","cooking",3,"cooking"],["🧇","waffle",3,"waffle"],["🥞","pancakes",3,"pancakes"],
+  ["🧈","butter",3,"butter"],["🍗","poultry leg",3,"poultry_leg"],["🍖","meat on bone",3,"meat_on_bone"],
+  ["🥩","cut of meat",3,"cut_of_meat"],["🥓","bacon",3,"bacon"],["🌭","hot dog",3,"hotdog"],
+  ["🍔","hamburger",3,"hamburger"],["🍟","french fries",3,"fries"],["🍕","pizza",3,"pizza"],
+  ["🌮","taco",3,"taco"],["🌯","burrito",3,"burrito"],["🫔","tamale",3],
+  ["🥙","stuffed flatbread",3,"stuffed_flatbread"],["🧆","falafel",3,"falafel"],
+  ["🍝","spaghetti",3,"spaghetti"],["🥗","green salad",3,"salad"],
+  ["🥘","shallow pan of food",3,"shallow_pan_of_food"],["🥫","canned food",3,"canned_food"],
+  ["🍱","bento box",3,"bento"],["🍙","rice ball",3,"rice_ball"],["🍚","cooked rice",3,"rice"],
+  ["🍛","curry rice",3,"curry"],["🍜","steaming bowl",3,"ramen"],["🍲","pot of food",3,"stew"],
+  ["🍣","sushi",3,"sushi"],["🍤","fried shrimp",3,"fried_shrimp"],["🦪","oyster",3,"oyster"],
+  ["🍦","soft ice cream",3,"icecream"],["🍩","doughnut",3,"doughnut"],["🍪","cookie",3,"cookie"],
+  ["🎂","birthday cake",3,"birthday"],["🍰","shortcake",3,"cake"],["🧁","cupcake",3,"cupcake"],
+  ["🍫","chocolate bar",3,"chocolate_bar"],["🍬","candy",3,"candy"],["🍭","lollipop",3,"lollipop"],
+  ["🍯","honey pot",3,"honey_pot"],["☕","hot beverage",3,"coffee"],["🫖","teapot",3,"teapot"],
+  ["🍵","teacup without handle",3,"tea"],["🧃","beverage box",3,"beverage_box"],
+  ["🥤","cup with straw",3,"cup_with_straw"],["🧋","bubble tea",3,"bubble_tea"],
+  ["🍺","beer mug",3,"beer"],["🍻","clinking beer mugs",3,"beers"],
+  ["🥂","clinking glasses",3,"champagne"],["🍷","wine glass",3,"wine_glass"],
+  ["🥃","tumbler glass",3,"tumbler_glass"],["🍸","cocktail glass",3,"cocktail"],
+  ["🍹","tropical drink",3,"tropical_drink"],["🍾","bottle with popping cork",3,"bottle_with_popping_cork"],
+  ["🧊","ice",3,"ice_cube"],["🥄","spoon",3,"spoon"],
+  ["🍴","fork and knife",3,"fork_and_knife"],["🥢","chopsticks",3,"chopsticks"],
+  // ── Travel & Places ──
+  ["🚗","automobile",4,"car"],["🚕","taxi",4,"taxi"],["🚙","sport utility vehicle",4,"blue_car"],
+  ["🚌","bus",4,"bus"],["🏎️","racing car",4,"racing_car"],["🚓","police car",4,"police_car"],
+  ["🚑","ambulance",4,"ambulance"],["🚒","fire engine",4,"fire_engine"],
+  ["🚚","delivery truck",4,"truck"],["🚜","tractor",4,"tractor"],
+  ["🛺","auto rickshaw",4,"auto_rickshaw"],["🚲","bicycle",4,"bike"],
+  ["🛴","kick scooter",4,"scooter"],["🛵","motor scooter",4,"motor_scooter"],
+  ["🏍️","motorcycle",4,"motorcycle"],["🚀","rocket",4,"rocket"],
+  ["🛸","flying saucer",4,"flying_saucer"],["✈️","airplane",4,"airplane"],
+  ["🛫","airplane departure",4,"airplane_departure"],["🛬","airplane arrival",4,"airplane_arriving"],
+  ["🪂","parachute",4,"parachute"],["🚁","helicopter",4,"helicopter"],
+  ["🛶","canoe",4,"canoe"],["⛵","sailboat",4,"sailboat"],["🚤","speedboat",4,"speedboat"],
+  ["🚢","ship",4,"ship"],["🚨","police car light",4,"rotating_light"],
+  ["🚥","horizontal traffic light",4,"traffic_light"],["🚦","vertical traffic light",4,"vertical_traffic_light"],
+  ["🛑","stop sign",4,"octagonal_sign"],["⛽","fuel pump",4,"fuelpump"],
+  ["⛰️","mountain",4,"mountain"],["🌋","volcano",4,"volcano"],
+  ["🏔️","snow-capped mountain",4,"snow_capped_mountain"],["🗻","mount fuji",4,"mount_fuji"],
+  ["🏕️","camping",4,"camping"],["🏖️","beach with umbrella",4,"beach_with_umbrella"],
+  ["🏜️","desert",4,"desert"],["🏝️","desert island",4,"desert_island"],
+  ["🌏","globe showing Asia-Australia",4,"earth_asia"],["🌍","globe showing Europe-Africa",4,"earth_africa"],
+  ["🌎","globe showing Americas",4,"earth_americas"],["🗺️","world map",4,"world_map"],
+  ["🏠","house",4,"house"],["🏡","house with garden",4,"house_with_garden"],
+  ["🏢","office building",4,"office"],["🏥","hospital",4,"hospital"],
+  ["🏦","bank",4,"bank"],["🏨","hotel",4,"hotel"],["🏪","convenience store",4,"convenience_store"],
+  ["🏫","school",4,"school"],["🏭","factory",4,"factory"],
+  ["🏰","castle",4,"european_castle"],["🏯","Japanese castle",4,"japanese_castle"],
+  ["💒","wedding",4,"wedding"],["🗼","Tokyo Tower",4,"tokyo_tower"],
+  ["🗽","Statue of Liberty",4,"statue_of_liberty"],["⛪","church",4,"church"],
+  ["🕌","mosque",4,"mosque"],["🛕","hindu temple",4,"hindu_temple"],
+  // ── Activities ──
+  ["⚽","soccer ball",5,"soccer"],["🏀","basketball",5,"basketball"],
+  ["🏈","american football",5,"football"],["⚾","baseball",5,"baseball"],
+  ["🥎","softball",5,"softball"],["🎾","tennis",5,"tennis"],
+  ["🏐","volleyball",5,"volleyball"],["🏉","rugby football",5,"rugby_football"],
+  ["🥏","flying disc",5,"flying_disc"],["🎱","pool 8 ball",5,"8ball"],
+  ["🏓","ping pong",5,"table_tennis_paddle_and_ball"],["🏸","badminton",5,"badminton"],
+  ["🏒","ice hockey",5,"ice_hockey"],["🥍","lacrosse",5,"lacrosse"],
+  ["🪃","boomerang",5,"boomerang"],["🥅","goal net",5,"goal_net"],
+  ["⛳","flag in hole",5,"golf"],["🪁","bow and arrow",5,"archery"],
+  ["🎣","fishing pole",5,"fishing_pole_and_fish"],["🤿","diving mask",5,"diving_mask"],
+  ["🎿","skis",5,"ski"],["🛷","sled",5,"sled"],["🥌","curling stone",5,"curling_stone"],
+  ["🎯","bullseye",5,"dart"],["🎮","video game",5,"video_game"],
+  ["🕹️","joystick",5,"joystick"],["🎲","game die",5,"game_die"],
+  ["♟️","chess pawn",5,"chess_pawn"],["🧩","puzzle piece",5,"jigsaw"],
+  ["🎭","performing arts",5,"performing_arts"],["🎨","artist palette",5,"art"],
+  ["🖼️","framed picture",5,"framed_picture"],["🎪","circus tent",5,"circus_tent"],
+  ["🎤","microphone",5,"microphone"],["🎧","headphone",5,"headphones"],
+  ["🎼","musical score",5,"musical_score"],["🎵","musical note",5,"musical_note"],
+  ["🎶","musical notes",5,"notes"],["🎸","guitar",5,"guitar"],["🪕","banjo",5,"banjo"],
+  ["🎹","musical keyboard",5,"musical_keyboard"],["🥁","drum",5,"drum"],
+  ["🪘","long drum",5,"long_drum"],["🎷","saxophone",5,"saxophone"],
+  ["🎺","trumpet",5,"trumpet"],["🎻","violin",5,"violin"],["🪗","accordion",5,"accordion"],
+  ["🎬","clapper board",5,"clapper"],["🎥","movie camera",5,"movie_camera"],
+  ["📷","camera",5,"camera"],["🎦","cinema",5,"cinema"],
+  // ── Objects ──
+  ["💡","light bulb",6,"bulb"],["🔦","flashlight",6,"flashlight"],["🕯️","candle",6,"candle"],
+  ["💰","money bag",6,"moneybag"],["💵","dollar banknote",6,"dollar"],
+  ["💳","credit card",6,"credit_card"],["💎","gem stone",6,"gem"],
+  ["⚖️","balance scale",6,"scales"],["🔧","wrench",6,"wrench"],["🔨","hammer",6,"hammer"],
+  ["🛠️","hammer and wrench",6,"hammer_and_wrench"],["⚙️","gear",6,"gear"],
+  ["🔗","link",6,"link"],["🧲","magnet",6,"magnet"],["🔫","water pistol",6,"gun"],
+  ["💣","bomb",6,"bomb"],["🔪","kitchen knife",6,"hocho"],["🧰","toolbox",6,"toolbox"],
+  ["🪜","ladder",6,"ladder"],["🧪","test tube",6,"test_tube"],
+  ["🧴","lotion bottle",6,"lotion_bottle"],["🧷","safety pin",6,"safety_pin"],
+  ["🧹","broom",6,"broom"],["🧺","basket",6,"basket"],["🧻","roll of paper",6,"roll_of_paper"],
+  ["🪣","bucket",6,"bucket"],["🧼","soap",6,"soap"],["🪥","toothbrush",6,"toothbrush"],
+  ["🧽","sponge",6,"sponge"],["💊","pill",6,"pill"],["💉","syringe",6,"syringe"],
+  ["🩺","stethoscope",6,"stethoscope"],["🩹","adhesive bandage",6,"adhesive_bandage"],
+  ["🚪","door",6,"door"],["🛏️","bed",6,"bed"],["🛋️","couch and lamp",6,"couch_and_lamp"],
+  ["🪑","chair",6,"chair"],["🚽","toilet",6,"toilet"],["🚿","shower",6,"shower"],
+  ["📱","mobile phone",6,"iphone"],["💻","laptop",6,"computer"],
+  ["⌨️","keyboard",6,"keyboard"],["🖥️","desktop computer",6,"desktop_computer"],
+  ["🖨️","printer",6,"printer"],["🖱️","computer mouse",6,"computer_mouse"],
+  ["💾","floppy disk",6,"floppy_disk"],["💿","optical disk",6,"cd"],
+  ["📺","television",6,"tv"],["📞","telephone receiver",6,"telephone_receiver"],
+  ["☎️","telephone",6,"phone"],["📡","satellite antenna",6,"satellite"],
+  ["🔋","battery",6,"battery"],["🔌","electric plug",6,"electric_plug"],
+  ["📚","books",6,"books"],["📖","open book",6,"open_book"],["📝","memo",6,"memo"],
+  ["🔍","magnifying glass tilted left",6,"mag"],["📋","clipboard",6,"clipboard"],
+  ["📌","pushpin",6,"pushpin"],["📎","paperclip",6,"paperclip"],["✂️","scissors",6,"scissors"],
+  ["🔒","locked",6,"lock"],["🔓","unlocked",6,"unlock"],["🔑","key",6,"key"],
+  ["📦","package",6,"package"],["📫","closed mailbox with raised flag",6,"mailbox"],
+  ["✏️","pencil",6,"pencil2"],["🎁","wrapped gift",6,"gift"],["🎀","ribbon",6,"ribbon"],
+  ["🎊","confetti ball",6,"confetti_ball"],["🎉","party popper",6,"tada"],
+  ["🎈","balloon",6,"balloon"],["🏆","trophy",6,"trophy"],
+  ["🥇","1st place medal",6,"first_place_medal"],["🥈","2nd place medal",6,"second_place_medal"],
+  ["🥉","3rd place medal",6,"third_place_medal"],
+  // ── Symbols ──
+  ["✅","check mark button",7,"white_check_mark"],["❌","cross mark",7,"x"],
+  ["❓","question mark",7,"question"],["❗","exclamation mark",7,"exclamation"],
+  ["‼️","double exclamation mark",7,"bangbang"],["⁉️","exclamation question mark",7,"interrobang"],
+  ["🔔","bell",7,"bell"],["🔕","bell with slash",7,"no_bell"],
+  ["🔇","muted speaker",7,"mute"],["🔊","speaker high volume",7,"loud_sound"],
+  ["📢","loudspeaker",7,"loudspeaker"],["📣","megaphone",7,"mega"],
+  ["▶️","play button",7,"arrow_forward"],["⏩","fast-forward button",7,"fast_forward"],
+  ["◀️","reverse button",7,"arrow_backward"],["⏪","fast reverse button",7,"rewind"],
+  ["⏸️","pause button",7,"double_vertical_bar"],["⏹️","stop button",7,"black_square_for_stop"],
+  ["🔀","shuffle tracks button",7,"twisted_rightwards_arrows"],["🔁","repeat button",7,"repeat"],
+  ["🔴","red circle",7,"red_circle"],["🟠","orange circle",7,"orange_circle"],
+  ["🟡","yellow circle",7,"yellow_circle"],["🟢","green circle",7,"green_circle"],
+  ["🔵","blue circle",7,"blue_circle"],["🟣","purple circle",7,"purple_circle"],
+  ["⚫","black circle",7,"black_circle"],["⚪","white circle",7,"white_circle"],
+  ["🟤","brown circle",7,"brown_circle"],["🔶","large orange diamond",7,"large_orange_diamond"],
+  ["🔷","large blue diamond",7,"large_blue_diamond"],
+  ["🔺","red triangle pointed up",7,"small_red_triangle"],
+  ["🔻","red triangle pointed down",7,"small_red_triangle_down"],
+  ["🟥","red square",7,"red_square"],["🟧","orange square",7,"orange_square"],
+  ["🟨","yellow square",7,"yellow_square"],["🟩","green square",7,"green_square"],
+  ["🟦","blue square",7,"blue_square"],["🟪","purple square",7,"purple_square"],
+  ["⬛","black large square",7,"black_large_square"],["⬜","white large square",7,"white_large_square"],
+  ["🟫","brown square",7,"brown_square"],
+  ["↗️","up-right arrow",7,"arrow_upper_right"],["➡️","right arrow",7,"arrow_right"],
+  ["↘️","down-right arrow",7,"arrow_lower_right"],["↙️","down-left arrow",7,"arrow_lower_left"],
+  ["↖️","up-left arrow",7,"arrow_upper_left"],["⬆️","up arrow",7,"arrow_up"],
+  ["⬇️","down arrow",7,"arrow_down"],["↕️","up-down arrow",7,"arrows_up_down"],
+  ["↔️","left-right arrow",7,"left_right_arrow"],["↩️","right arrow curving left",7,"leftwards_arrow_with_hook"],
+  ["↪️","left arrow curving right",7,"arrow_right_hook"],
+  ["🔃","clockwise vertical arrows",7,"arrows_clockwise"],
+  ["🔄","counterclockwise arrows button",7,"arrows_counterclockwise"],
+  ["🔙","BACK arrow",7,"back"],["🔚","END arrow",7,"end"],
+  ["🔛","ON! arrow",7,"on"],["🔜","SOON arrow",7,"soon"],["🔝","TOP arrow",7,"top"],
+  ["♻️","recycling symbol",7,"recycle"],["⚠️","warning",7,"warning"],
+  ["☢️","radioactive",7,"radioactive"],["☣️","biohazard",7,"biohazard"],
+  ["✔️","check mark",7,"heavy_check_mark"],["☑️","check box with check",7,"ballot_box_with_check"],
+  ["❎","cross mark button",7,"negative_squared_cross_mark"],
+  ["🆗","OK button",7,"ok"],["🆒","COOL button",7,"cool"],
+  ["🆕","NEW button",7,"new"],["🆓","FREE button",7,"free"],
+  ["🆘","SOS button",7,"sos"],["🆙","UP! button",7,"up"],["🆚","VS button",7,"vs"],
+  ["♈","Aries",7,"aries"],["♉","Taurus",7,"taurus"],["♊","Gemini",7,"gemini"],
+  ["♋","Cancer",7,"cancer"],["♌","Leo",7,"leo"],["♍","Virgo",7,"virgo"],
+  ["♎","Libra",7,"libra"],["♏","Scorpius",7,"scorpius"],["♐","Sagittarius",7,"sagittarius"],
+  ["♑","Capricorn",7,"capricorn"],["♒","Aquarius",7,"aquarius"],["♓","Pisces",7,"pisces"],
+  ["⛎","Ophiuchus",7,"ophiuchus"],["☮️","peace symbol",7,"peace_symbol"],
+  ["✝️","latin cross",7,"latin_cross"],["☯️","yin yang",7,"yin_yang"],
+  ["🕉️","om",7,"om_symbol"],["☪️","star and crescent",7,"star_and_crescent"],
+  ["🔰","Japanese symbol for beginner",7,"beginner"],["⭕","hollow red circle",7,"o"],
+  ["©️","copyright",7,"copyright"],["®️","registered",7,"registered"],["™️","trade mark",7,"tm"],
+  ["🔮","crystal ball",7,"crystal_ball"],["🪄","magic wand",7,"magic_wand"],
+  ["🎴","flower playing cards",7,"flower_playing_cards"],["🃏","joker",7,"black_joker"],
+  ["♠️","spade suit",7,"spades"],["♥️","heart suit",7,"hearts"],
+  ["♦️","diamond suit",7,"diamonds"],["♣️","club suit",7,"clubs"],
+];
+
+// Build lookup structures
+const EMOJI_SHORTCODE_MAP = Object.create(null);
+const _EMOJI_SEARCH = [];
+const EMOJI_CATEGORIES = [
+  { icon: "😀", name: "Smileys",    emojis: [] },
+  { icon: "👋", name: "People",     emojis: [] },
+  { icon: "🐶", name: "Animals",    emojis: [] },
+  { icon: "🍕", name: "Food",       emojis: [] },
+  { icon: "🏖️", name: "Travel",     emojis: [] },
+  { icon: "⚽", name: "Activities", emojis: [] },
+  { icon: "💡", name: "Objects",    emojis: [] },
+  { icon: "❤️", name: "Symbols",    emojis: [] },
+];
+for (const [e, n, cat, sc] of _EMOJI_RAW) {
+  EMOJI_CATEGORIES[cat].emojis.push(e);
+  _EMOJI_SEARCH.push({ e, n });
+  if (sc) EMOJI_SHORTCODE_MAP[sc] = e;
+}
+
+let _emojiHoverTimer = null;
+let _emojiLastConversion = null; // { text, emoji } for backspace undo
+let _emojiConverting = false;    // suppress re-entry during conversion
+
+// Replaces Unicode emoji in `el` with Apple emoji <img> (via Twemoji parser + Apple CDN).
+// Safe to call multiple times; skips already-converted images.
+function applyAppleEmoji(el) {
+  if (!el || typeof twemoji === "undefined") return;
+  twemoji.parse(el, {
+    folder: "64",
+    ext: ".png",
+    base: "/emoji/apple/",
+    attributes: () => ({ draggable: "false" }),
+  });
+}
+
+function _emojiInsert(emoji) {
+  const inputEl = document.getElementById("chat-input");
+  if (!inputEl) return;
+  inputEl.focus();
+  document.execCommand("insertText", false, emoji);
+  inputEl.dispatchEvent(new Event("input"));
+}
+
+function _positionEmojiDock() {
+  const dock = document.getElementById("emoji-dock");
+  const chatMain = document.querySelector(".chat-main");
+  if (!dock || !chatMain) return;
+  const r = chatMain.getBoundingClientRect();
+  dock.style.left = `${r.right + 8}px`;
+  dock.style.top  = `${r.top}px`;
+  dock.style.height = `${r.height}px`;
+}
+
+function tryEmojiShortcode(inputEl) {
+  if (_emojiConverting) return;
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return;
+  const range = sel.getRangeAt(0);
+  if (!range.collapsed) return;
+  const node = range.endContainer;
+  if (node.nodeType !== Node.TEXT_NODE) return;
+  const textBefore = node.textContent.substring(0, range.endOffset);
+  const match = textBefore.match(/:(\w+):$/);
+  if (!match) return;
+  const emoji = EMOJI_SHORTCODE_MAP[match[1]];
+  if (!emoji) return;
+  const fullMatch = match[0];
+  const startOffset = range.endOffset - fullMatch.length;
+  const replaceRange = document.createRange();
+  replaceRange.setStart(node, startOffset);
+  replaceRange.setEnd(node, range.endOffset);
+  sel.removeAllRanges();
+  sel.addRange(replaceRange);
+  _emojiConverting = true;
+  document.execCommand("insertText", false, emoji);
+  _emojiConverting = false;
+  _emojiLastConversion = { text: fullMatch, emoji };
+}
+
+function undoEmojiConversion() {
+  if (!_emojiLastConversion) return false;
+  const { text, emoji } = _emojiLastConversion;
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return false;
+  const range = sel.getRangeAt(0);
+  const node = range.endContainer;
+  if (node.nodeType !== Node.TEXT_NODE) return false;
+  const textBefore = node.textContent.substring(0, range.endOffset);
+  if (!textBefore.endsWith(emoji)) return false;
+  const emojiLen = emoji.length;
+  const undoRange = document.createRange();
+  undoRange.setStart(node, range.endOffset - emojiLen);
+  undoRange.setEnd(node, range.endOffset);
+  sel.removeAllRanges();
+  sel.addRange(undoRange);
+  _emojiConverting = true;
+  document.execCommand("insertText", false, text);
+  _emojiConverting = false;
+  _emojiLastConversion = null;
+  return true;
+}
+
+function initEmojiPicker() {
+  if (document.getElementById("emoji-hover-popup")) return;
+
+  // ── Shared helpers ──
+
+  // Render every category as a continuous scrollable list with section headers
+  function _renderAllEmojis(bodyEl) {
+    bodyEl.innerHTML = EMOJI_CATEGORIES.map((cat, i) =>
+      `<div class="emoji-section" data-section="${i}">` +
+      `<div class="emoji-section-label">${cat.name}</div>` +
+      `<div class="emoji-section-grid">` +
+      cat.emojis.map(e => `<button class="emoji-cell" data-emoji="${e}">${e}</button>`).join("") +
+      `</div></div>`
+    ).join("");
+    applyAppleEmoji(bodyEl);
+  }
+
+  // Bind category tabs so they scroll to the matching section;
+  // also update active tab on scroll.
+  function _bindTabNav(tabsEl, bodyEl) {
+    tabsEl.addEventListener("click", (e) => {
+      const tab = e.target.closest("[data-cat]");
+      if (!tab) return;
+      const section = bodyEl.querySelector(`[data-section="${tab.dataset.cat}"]`);
+      if (section) bodyEl.scrollTop = section.offsetTop;
+      tabsEl.querySelectorAll(".emoji-tab").forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+    });
+    bodyEl.addEventListener("scroll", () => {
+      const sections = bodyEl.querySelectorAll(".emoji-section");
+      if (!sections.length) return;
+      let activeIdx = 0;
+      sections.forEach(s => {
+        if (s.offsetTop <= bodyEl.scrollTop + 20) activeIdx = +s.dataset.section;
+      });
+      tabsEl.querySelectorAll(".emoji-tab").forEach(t => {
+        t.classList.toggle("active", +t.dataset.cat === activeIdx);
+      });
+    }, { passive: true });
+  }
+
+  // ── Hover popup (mini dock — identical layout, no search, disappears on mouse leave) ──
+  const hoverPopup = document.createElement("div");
+  hoverPopup.id = "emoji-hover-popup";
+  hoverPopup.className = "emoji-hover-popup";
+  hoverPopup.style.display = "none";
+
+  const hpTabsHtml = EMOJI_CATEGORIES.map((c, i) =>
+    `<button class="emoji-tab${i === 0 ? " active" : ""}" data-cat="${i}" title="${c.name}">${c.icon}</button>`
+  ).join("");
+  hoverPopup.innerHTML = `
+    <div class="emoji-dock-header">
+      <div class="emoji-tabs" id="emoji-hp-tabs">${hpTabsHtml}</div>
+    </div>
+    <div class="emoji-hover-body" id="emoji-hover-body"></div>
+  `;
+  document.body.appendChild(hoverPopup);
+  applyAppleEmoji(hoverPopup.querySelector(".emoji-tabs"));
+  _renderAllEmojis(document.getElementById("emoji-hover-body"));
+  _bindTabNav(
+    document.getElementById("emoji-hp-tabs"),
+    document.getElementById("emoji-hover-body")
+  );
+
+  hoverPopup.addEventListener("mousedown", e => e.preventDefault());
+  hoverPopup.addEventListener("mouseenter", () => clearTimeout(_emojiHoverTimer));
+  hoverPopup.addEventListener("mouseleave", () => {
+    _emojiHoverTimer = setTimeout(() => { hoverPopup.style.display = "none"; }, 200);
+  });
+  hoverPopup.addEventListener("click", e => {
+    const cell = e.target.closest("[data-emoji]");
+    if (!cell) return;
+    _emojiInsert(cell.dataset.emoji);
+  });
+
+  // ── Docked panel ──
+  const dock = document.createElement("div");
+  dock.id = "emoji-dock";
+  dock.className = "emoji-dock";
+  dock.style.display = "none";
+
+  const dockTabsHtml = EMOJI_CATEGORIES.map((c, i) =>
+    `<button class="emoji-tab${i === 0 ? " active" : ""}" data-cat="${i}" title="${c.name}">${c.icon}</button>`
+  ).join("");
+  dock.innerHTML = `
+    <div class="emoji-dock-header">
+      <div class="emoji-tabs" id="emoji-dock-tabs">${dockTabsHtml}</div>
+      <button class="emoji-dock-close" id="emoji-dock-close" title="Close">✕</button>
+    </div>
+    <div class="emoji-search-wrap">
+      <input class="emoji-search" id="emoji-search" type="text"
+             placeholder="Search emoji…" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="emoji-dock-body" id="emoji-dock-body"></div>
+  `;
+  document.body.appendChild(dock);
+
+  const dockBodyEl = document.getElementById("emoji-dock-body");
+  const dockTabsEl = document.getElementById("emoji-dock-tabs");
+  applyAppleEmoji(dock.querySelector(".emoji-tabs"));
+  _renderAllEmojis(dockBodyEl);
+  _bindTabNav(dockTabsEl, dockBodyEl);
+
+  dock.addEventListener("mousedown", e => {
+    if (!e.target.closest(".emoji-search")) e.preventDefault();
+  });
+  dock.addEventListener("click", e => {
+    const cell = e.target.closest(".emoji-cell[data-emoji]");
+    if (cell) {
+      _emojiInsert(cell.dataset.emoji);
+      setTimeout(() => document.getElementById("chat-input")?.focus(), 0);
+    }
+  });
+
+  // Search
+  dock.querySelector(".emoji-search").addEventListener("input", e => {
+    const q = e.target.value.trim().toLowerCase();
+    if (!q) {
+      _renderAllEmojis(dockBodyEl);
+      dockBodyEl.scrollTop = 0;
+      dockTabsEl.querySelectorAll(".emoji-tab").forEach((t, i) =>
+        t.classList.toggle("active", i === 0)
+      );
+      return;
+    }
+    const results = _EMOJI_SEARCH.filter(({ n }) => n.includes(q));
+    dockBodyEl.innerHTML = results.length
+      ? `<div class="emoji-section-grid">${results.map(({ e }) =>
+          `<button class="emoji-cell" data-emoji="${e}">${e}</button>`).join("")}</div>`
+      : `<div class="emoji-no-results">Nothing found for "${q}"</div>`;
+    if (results.length) applyAppleEmoji(dockBodyEl);
+  });
+
+  document.getElementById("emoji-dock-close").addEventListener("click", () => {
+    dock.style.display = "none";
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && dock.style.display !== "none") dock.style.display = "none";
+  });
+  window.addEventListener("resize", () => {
+    if (dock.style.display !== "none") _positionEmojiDock();
+  });
+}
+
+function setupEmojiBtn() {
+  const btn = document.getElementById("emoji-btn");
+  if (!btn) return;
+  const hoverPopup = document.getElementById("emoji-hover-popup");
+  const dock = document.getElementById("emoji-dock");
+  if (!hoverPopup || !dock) return;
+
+  btn.onmouseenter = () => {
+    clearTimeout(_emojiHoverTimer);
+    if (dock.style.display !== "none") return;
+    hoverPopup.style.display = "flex";
+    const r = btn.getBoundingClientRect();
+    const pw = hoverPopup.offsetWidth || 288;
+    const ph = hoverPopup.offsetHeight || 340;
+    // Button is on the right — right-align popup with button right edge
+    let left = r.right - pw;
+    if (left < 8) left = 8;
+    let top = r.top - ph - 8;
+    if (top < 8) top = r.bottom + 8;
+    hoverPopup.style.left = `${left}px`;
+    hoverPopup.style.top  = `${top}px`;
+  };
+
+  btn.onmouseleave = () => {
+    _emojiHoverTimer = setTimeout(() => { hoverPopup.style.display = "none"; }, 200);
+  };
+
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    hoverPopup.style.display = "none";
+    clearTimeout(_emojiHoverTimer);
+    if (dock.style.display !== "none") {
+      dock.style.display = "none";
+    } else {
+      // Reset search when opening
+      const searchEl = document.getElementById("emoji-search");
+      if (searchEl) { searchEl.value = ""; searchEl.dispatchEvent(new Event("input")); }
+      dock.style.display = "flex";
+      _positionEmojiDock();
+    }
+  };
+}
+
 // ─── Init ───
 
 initFormatMenu();
+initEmojiPicker();
 initMessageContextMenu();
 initLightbox();
 

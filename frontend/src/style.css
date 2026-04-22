@@ -24,6 +24,72 @@ body {
   min-height: 100vh;
 }
 
+/* ─── Overlay scrollbars — thin, transparent, appear only on hover/scroll ─── */
+/*
+  "overlay" keeps the scrollbar above content so it never shifts layout.
+  The thumb is invisible by default and fades in when the container is hovered.
+  No track, no buttons — just a 4 px translucent slider.
+*/
+.chat-messages,
+.chat-list,
+.emoji-dock-body,
+.emoji-hover-body {
+  /* Chromium / Safari: overlay mode — scrollbar floats on top, no layout shift */
+  overflow-y: overlay;
+  /* Firefox: thin bar, hidden by default */
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+/* Show the thumb when hovering */
+.chat-messages:hover,
+.chat-list:hover,
+.emoji-dock-body:hover,
+.emoji-hover-body:hover {
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+
+/* WebKit fine-grained control */
+.chat-messages::-webkit-scrollbar,
+.chat-list::-webkit-scrollbar,
+.emoji-dock-body::-webkit-scrollbar,
+.emoji-hover-body::-webkit-scrollbar {
+  width: 4px;
+  background: transparent;
+}
+
+.chat-messages::-webkit-scrollbar-track,
+.chat-list::-webkit-scrollbar-track,
+.emoji-dock-body::-webkit-scrollbar-track,
+.emoji-hover-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Kill the arrow buttons entirely */
+.chat-messages::-webkit-scrollbar-button,
+.chat-list::-webkit-scrollbar-button,
+.emoji-dock-body::-webkit-scrollbar-button,
+.emoji-hover-body::-webkit-scrollbar-button {
+  display: none;
+  height: 0;
+}
+
+/* Thumb: transparent normally, visible on container hover */
+.chat-messages::-webkit-scrollbar-thumb,
+.chat-list::-webkit-scrollbar-thumb,
+.emoji-dock-body::-webkit-scrollbar-thumb,
+.emoji-hover-body::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+}
+
+.chat-messages:hover::-webkit-scrollbar-thumb,
+.chat-list:hover::-webkit-scrollbar-thumb,
+.emoji-dock-body:hover::-webkit-scrollbar-thumb,
+.emoji-hover-body:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+}
+
 #app {
   max-width: 900px;
   margin: 0 auto;
@@ -55,6 +121,38 @@ header {
   margin-bottom: 6px;
   color: var(--text-muted);
   font-size: 14px;
+}
+
+input, textarea, button, select {
+  font-family: inherit;
+}
+
+/* ─── Apple emoji image replacement (via Twemoji parser) ─── */
+img.emoji {
+  height: 1.15em;
+  width: 1.15em;
+  vertical-align: -0.2em;
+  display: inline-block;
+  object-fit: contain;
+  /* no selection border on click */
+  outline: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Bigger in the emoji picker grid */
+.emoji-cell img.emoji {
+  height: 22px;
+  width: 22px;
+  vertical-align: middle;
+}
+
+/* Emoji button icon (the 😁 grin static image, not a Twemoji replacement) */
+.emoji-btn img {
+  width: 20px;
+  height: 20px;
+  display: block;
+  object-fit: contain;
 }
 
 input, textarea {
@@ -238,7 +336,7 @@ input:focus, textarea:focus {
 
 .chat-list {
   flex: 1;
-  overflow-y: auto;
+  overflow-y: overlay;
 }
 
 .chat-item {
@@ -325,7 +423,7 @@ input:focus, textarea:focus {
 
 .chat-messages {
   flex: 1;
-  overflow-y: auto;
+  overflow-y: overlay;
   padding: 16px 20px;
   display: flex;
   flex-direction: column;
@@ -722,6 +820,8 @@ input:focus, textarea:focus {
   min-height: 38px;
   max-height: 160px;
   overflow-y: auto;
+  /* hide scrollbar — text grows inside without a visible track */
+  scrollbar-width: none;
   padding: 8px 14px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -744,6 +844,10 @@ input:focus, textarea:focus {
   content: attr(data-placeholder);
   color: var(--text-muted);
   pointer-events: none;
+}
+
+.chat-input-field::-webkit-scrollbar {
+  display: none;
 }
 
 /* ─── Format menu ─── */
@@ -1032,6 +1136,184 @@ input:focus, textarea:focus {
 
 .attach-item:hover {
   background: var(--border);
+}
+
+/* ─── Emoji picker ─── */
+
+/* Hover popup — identical structure to dock, fixed height, no search */
+.emoji-hover-popup {
+  position: fixed;
+  z-index: 4000;
+  width: 288px;
+  height: 340px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.emoji-hover-body {
+  flex: 1;
+  overflow-x: hidden;
+  padding: 4px 6px 6px;
+  display: flex;
+  flex-direction: column;
+}
+
+.emoji-cell {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  padding: 0;
+  line-height: 1;
+  transition: background 0.1s;
+  flex-shrink: 0;
+}
+
+.emoji-cell:hover {
+  background: var(--border);
+}
+
+/* Section layout inside scrollable body */
+.emoji-section {
+  margin-bottom: 6px;
+}
+
+.emoji-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  padding: 6px 2px 4px;
+  user-select: none;
+}
+
+.emoji-section-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 32px);
+  gap: 2px;
+}
+
+.emoji-dock {
+  position: fixed;
+  z-index: 3900;
+  width: 288px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.emoji-dock-header {
+  display: flex;
+  align-items: center;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.emoji-tabs {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+  flex-wrap: wrap;
+}
+
+.emoji-tab {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  padding: 0;
+  transition: background 0.1s;
+}
+
+.emoji-tab:hover {
+  background: var(--border);
+}
+
+.emoji-tab.active {
+  background: rgba(99, 102, 241, 0.2);
+}
+
+.emoji-dock-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s;
+}
+
+.emoji-dock-close:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.emoji-search-wrap {
+  padding: 6px 8px 4px;
+  flex-shrink: 0;
+}
+
+.emoji-search {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 13px;
+  padding: 5px 8px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.emoji-search:focus {
+  border-color: var(--accent);
+}
+
+.emoji-search::placeholder {
+  color: var(--text-muted);
+}
+
+.emoji-dock-body {
+  flex: 1;
+  overflow-x: hidden;
+  padding: 4px 6px 6px;
+  display: flex;
+  flex-direction: column;
+}
+
+.emoji-no-results {
+  padding: 24px 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 /* ─── Pending attachments tray ─── */

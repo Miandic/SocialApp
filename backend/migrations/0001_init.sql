@@ -59,17 +59,6 @@ CREATE TABLE chats (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ─── Chat members ───
-CREATE TABLE chat_members (
-    chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role VARCHAR(20) NOT NULL DEFAULT 'member',
-    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (chat_id, user_id)
-);
-
-CREATE INDEX idx_chat_members_user ON chat_members (user_id);
-
 -- ─── Messages (E2E encrypted) ───
 CREATE TABLE messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -82,6 +71,19 @@ CREATE TABLE messages (
 );
 
 CREATE INDEX idx_messages_chat ON messages (chat_id, created_at DESC);
+
+-- ─── Chat members ───
+CREATE TABLE chat_members (
+    chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL DEFAULT 'member',
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_read_message_id UUID REFERENCES messages(id) ON DELETE SET NULL,
+    last_read_at TIMESTAMPTZ,
+    PRIMARY KEY (chat_id, user_id)
+);
+
+CREATE INDEX idx_chat_members_user ON chat_members (user_id);
 
 -- ─── E2E Key bundles (Signal-like key exchange) ───
 CREATE TABLE user_key_bundles (

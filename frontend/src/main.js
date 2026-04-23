@@ -971,7 +971,6 @@ async function openChat(chatId) {
           : `<strong>${escapeHtml(name)}</strong>`}
         <span style="color:var(--text-muted);font-size:13px">${memberCount}</span>
       `;
-      applyAppleEmoji(chatHeaderEl);
       if (other) {
         document.querySelector(".chat-header-link")?.addEventListener("click", () => {
           navigate("profile", { username: other.username });
@@ -991,7 +990,6 @@ async function openChat(chatId) {
     } else {
       const ordered = messages.slice().reverse();
       messagesEl.innerHTML = ordered.map((m, i) => renderMessage(m, i > 0 ? ordered[i - 1] : null)).join("");
-      applyAppleEmoji(messagesEl);
       scrollMessagesDown();
 
       // Mark the last message as read (if it's not mine)
@@ -1078,7 +1076,8 @@ async function openChat(chatId) {
 
   document.getElementById("chat-input-form").onsubmit = async (e) => {
     e.preventDefault();
-    const hasText = !!inputEl.textContent.trim();
+    // textContent misses <img alt> — also check for emoji images
+    const hasText = !!inputEl.textContent.trim() || !!inputEl.querySelector("img.emoji");
     const hasAttachments = pendingAttachments.length > 0;
     if (!hasText && !hasAttachments) return;
 
@@ -1129,8 +1128,9 @@ async function openChat(chatId) {
   let typingTimeout = null;
   inputEl.oninput = () => {
     if (!_emojiConverting) {
-      _emojiLastConversion = null;        // clear on any manual input
-      tryEmojiShortcode(inputEl);         // try :shortcode: → 😀 conversion
+      _emojiLastConversion = null;           // clear on any manual input
+      tryEmojiShortcode(inputEl);            // try :shortcode: → 😀 conversion
+      _applyEmojiToInputSafe(inputEl);       // convert any typed/pasted Unicode emoji → Apple <img>
     }
     if (!typingTimeout) {
       sendWs({ type: "typing", chat_id: chatId });
@@ -1181,8 +1181,6 @@ function appendMessage(msg) {
   const prevMsg = lastEl ? { sender_id: lastEl.dataset.senderId, created_at: lastEl.dataset.createdAt } : null;
 
   messagesEl.insertAdjacentHTML("beforeend", renderMessage(msg, prevMsg));
-  // Apply Apple emoji to the newly added message only
-  applyAppleEmoji(messagesEl.lastElementChild);
 }
 
 function scrollMessagesDown() {
@@ -1382,6 +1380,12 @@ function serializeRichText(el) {
       }
     } else if (node.nodeName === "BR") {
       spans.push({ t: "\n", s: null });
+    } else if (node.nodeName === "IMG" && node.classList.contains("emoji") && node.alt) {
+      // Apple emoji image → serialize as the original Unicode character stored in alt
+      const s = inherited.length === 0 ? null
+              : inherited.length === 1 ? inherited[0]
+              : [...inherited];
+      spans.push({ t: node.alt, s });
     } else {
       const s = nodeStyle(node);
       const next = s ? [...inherited, s] : [...inherited];
@@ -2855,15 +2859,70 @@ let _emojiHoverTimer = null;
 let _emojiLastConversion = null; // { text, emoji } for backspace undo
 let _emojiConverting = false;    // suppress re-entry during conversion
 
-// Replaces Unicode emoji in `el` with Apple emoji <img> (via Twemoji parser + Apple CDN).
-// Safe to call multiple times; skips already-converted images.
+// Lazy-init: regex matching all known emoji (longest first) + codepoint cache.
+let _emojiRegex = null;
+let _emojiCpCache = null;
+function _initEmojiRegex() {
+  if (_emojiRegex || typeof twemoji === "undefined") return;
+  _emojiCpCache = new Map();
+  const sorted = _EMOJI_RAW.map(([e]) => e).sort((a, b) => b.length - a.length);
+  for (const e of sorted) _emojiCpCache.set(e, twemoji.convert.toCodePoint(e));
+  _emojiRegex = new RegExp(sorted.join("|"), "gu");
+}
+
+// Returns the <img> HTML for a single emoji char.
+function _emojiImgHtml(emoji) {
+  if (typeof twemoji === "undefined") return escapeHtml(emoji);
+  _initEmojiRegex();
+  const cp = (_emojiCpCache && _emojiCpCache.has(emoji))
+    ? _emojiCpCache.get(emoji)
+    : twemoji.convert.toCodePoint(emoji);
+  return `<img src="/emoji/apple/64/${cp}.png" alt="${escapeAttr(emoji)}" class="emoji" draggable="false">`;
+}
+
+// Walks every text node in `el`, replaces known emoji with Apple <img> elements.
+// More reliable than twemoji.parse for newer Unicode emoji not in Twemoji 14's regex.
+function _applyEmojiDirect(el) {
+  if (!el || typeof twemoji === "undefined") return;
+  _initEmojiRegex();
+  if (!_emojiRegex) return;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+  const nodes = [];
+  let n;
+  while ((n = walker.nextNode())) nodes.push(n);
+  for (const node of nodes) {
+    const text = node.textContent;
+    _emojiRegex.lastIndex = 0;
+    if (!_emojiRegex.test(text)) continue;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    _emojiRegex.lastIndex = 0;
+    let m;
+    while ((m = _emojiRegex.exec(text)) !== null) {
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const emoji = m[0];
+      const cp = _emojiCpCache.get(emoji) || twemoji.convert.toCodePoint(emoji);
+      const img = document.createElement("img");
+      img.src = `/emoji/apple/64/${cp}.png`;
+      img.alt = emoji;
+      img.className = "emoji";
+      img.setAttribute("draggable", "false");
+      frag.appendChild(img);
+      last = m.index + emoji.length;
+    }
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.replaceWith(frag);
+  }
+}
+
+// Kept for input field (handles OS-pasted emoji beyond our known set via Twemoji's regex).
 function applyAppleEmoji(el) {
   if (!el || typeof twemoji === "undefined") return;
   twemoji.parse(el, {
     folder: "64",
     ext: ".png",
     base: "/emoji/apple/",
-    attributes: () => ({ draggable: "false" }),
+    attributes: () => ({ draggable: "false", class: "emoji" }),
   });
 }
 
@@ -2871,8 +2930,38 @@ function _emojiInsert(emoji) {
   const inputEl = document.getElementById("chat-input");
   if (!inputEl) return;
   inputEl.focus();
-  document.execCommand("insertText", false, emoji);
-  inputEl.dispatchEvent(new Event("input"));
+  const sel = window.getSelection();
+  if (!sel) return;
+  // Ensure there is a selection inside the input field
+  let range;
+  if (sel.rangeCount && inputEl.contains(sel.getRangeAt(0).startContainer)) {
+    range = sel.getRangeAt(0);
+  } else {
+    range = document.createRange();
+    range.selectNodeContents(inputEl);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  if (typeof twemoji !== "undefined") {
+    const cp = twemoji.convert.toCodePoint(emoji);
+    const img = document.createElement("img");
+    img.src = `/emoji/apple/64/${cp}.png`;
+    img.alt = emoji;
+    img.className = "emoji";
+    img.setAttribute("draggable", "false");
+    range.deleteContents();
+    range.insertNode(img);
+    const after = document.createRange();
+    after.setStartAfter(img);
+    after.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(after);
+  } else {
+    document.execCommand("insertText", false, emoji);
+  }
+  // Fire input so the typing indicator and hasText checks stay correct
+  inputEl.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 function _positionEmojiDock() {
@@ -2903,11 +2992,30 @@ function tryEmojiShortcode(inputEl) {
   const replaceRange = document.createRange();
   replaceRange.setStart(node, startOffset);
   replaceRange.setEnd(node, range.endOffset);
-  sel.removeAllRanges();
-  sel.addRange(replaceRange);
-  _emojiConverting = true;
-  document.execCommand("insertText", false, emoji);
-  _emojiConverting = false;
+
+  if (typeof twemoji !== "undefined") {
+    // Insert Apple <img> directly — no execCommand needed, no extra oninput
+    const cp = twemoji.convert.toCodePoint(emoji);
+    const img = document.createElement("img");
+    img.src = `/emoji/apple/64/${cp}.png`;
+    img.alt = emoji;
+    img.className = "emoji";
+    img.setAttribute("draggable", "false");
+    replaceRange.deleteContents();
+    replaceRange.insertNode(img);
+    const after = document.createRange();
+    after.setStartAfter(img);
+    after.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(after);
+  } else {
+    // Fallback: insert Unicode char via execCommand
+    sel.removeAllRanges();
+    sel.addRange(replaceRange);
+    _emojiConverting = true;
+    document.execCommand("insertText", false, emoji);
+    _emojiConverting = false;
+  }
   _emojiLastConversion = { text: fullMatch, emoji };
 }
 
@@ -2917,21 +3025,156 @@ function undoEmojiConversion() {
   const sel = window.getSelection();
   if (!sel || !sel.rangeCount) return false;
   const range = sel.getRangeAt(0);
-  const node = range.endContainer;
-  if (node.nodeType !== Node.TEXT_NODE) return false;
-  const textBefore = node.textContent.substring(0, range.endOffset);
-  if (!textBefore.endsWith(emoji)) return false;
-  const emojiLen = emoji.length;
-  const undoRange = document.createRange();
-  undoRange.setStart(node, range.endOffset - emojiLen);
-  undoRange.setEnd(node, range.endOffset);
+  if (!range.collapsed) return false;
+
+  const container = range.endContainer;
+  const offset = range.endOffset;
+
+  // Primary: cursor is inside an element and the child just before it is the emoji <img>
+  if (container.nodeType === Node.ELEMENT_NODE && offset > 0) {
+    const prev = container.childNodes[offset - 1];
+    if (prev && prev.nodeName === "IMG" && prev.classList.contains("emoji") && prev.alt === emoji) {
+      const r = document.createRange();
+      r.selectNode(prev);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      _emojiConverting = true;
+      document.execCommand("insertText", false, text);
+      _emojiConverting = false;
+      _emojiLastConversion = null;
+      return true;
+    }
+  }
+  // Secondary: cursor is at start of a text node and the previous sibling is the emoji <img>
+  if (container.nodeType === Node.TEXT_NODE && offset === 0) {
+    const prev = container.previousSibling;
+    if (prev && prev.nodeName === "IMG" && prev.classList.contains("emoji") && prev.alt === emoji) {
+      const r = document.createRange();
+      r.selectNode(prev);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      _emojiConverting = true;
+      document.execCommand("insertText", false, text);
+      _emojiConverting = false;
+      _emojiLastConversion = null;
+      return true;
+    }
+  }
+  // Fallback: emoji is still a raw text node (twemoji unavailable)
+  if (container.nodeType === Node.TEXT_NODE) {
+    const textBefore = container.textContent.substring(0, offset);
+    if (textBefore.endsWith(emoji)) {
+      const r = document.createRange();
+      r.setStart(container, offset - emoji.length);
+      r.setEnd(container, offset);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      _emojiConverting = true;
+      document.execCommand("insertText", false, text);
+      _emojiConverting = false;
+      _emojiLastConversion = null;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ─── Cursor-preserving Twemoji application for the chat input field ───
+// Counts "logical characters" up to the cursor (text chars + emoji-img counted
+// by their alt string's length so JS-string offsets stay consistent).
+function _saveCursorOffset(root) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return -1;
+  const range = sel.getRangeAt(0);
+  if (!range.collapsed) return -1;
+  let offset = 0;
+  const tw = document.createTreeWalker(root, NodeFilter.SHOW_ALL);
+  while (tw.nextNode()) {
+    const n = tw.currentNode;
+    if (n === range.endContainer && n.nodeType === Node.TEXT_NODE) {
+      return offset + range.endOffset;
+    }
+    if (n.nodeType === Node.TEXT_NODE) {
+      offset += n.textContent.length;
+    } else if (n.nodeName === "IMG" && n.classList.contains("emoji")) {
+      offset += (n.alt || "").length;
+    }
+  }
+  return -1; // cursor not found inside root
+}
+
+function _restoreCursorOffset(root, savedOffset) {
+  if (savedOffset < 0) return;
+  const sel = window.getSelection();
+  if (!sel) return;
+  let remaining = savedOffset;
+  const tw = document.createTreeWalker(root, NodeFilter.SHOW_ALL);
+  while (tw.nextNode()) {
+    const n = tw.currentNode;
+    if (n.nodeType === Node.TEXT_NODE) {
+      const len = n.textContent.length;
+      if (remaining <= len) {
+        const r = document.createRange();
+        r.setStart(n, remaining);
+        r.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(r);
+        return;
+      }
+      remaining -= len;
+    } else if (n.nodeName === "IMG" && n.classList.contains("emoji")) {
+      const len = (n.alt || "").length;
+      if (remaining <= len) {
+        const r = document.createRange();
+        r.setStartAfter(n);
+        r.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(r);
+        return;
+      }
+      remaining -= len;
+    }
+  }
+  // Fallback: place cursor at end of root
+  const r = document.createRange();
+  r.selectNodeContents(root);
+  r.collapse(false);
   sel.removeAllRanges();
-  sel.addRange(undoRange);
-  _emojiConverting = true;
-  document.execCommand("insertText", false, text);
-  _emojiConverting = false;
-  _emojiLastConversion = null;
-  return true;
+  sel.addRange(r);
+}
+
+// Apply Twemoji to `inputEl` while keeping the cursor in the same logical position.
+function _applyEmojiToInputSafe(inputEl) {
+  if (document.activeElement !== inputEl) {
+    applyAppleEmoji(inputEl);
+    return;
+  }
+  const saved = _saveCursorOffset(inputEl);
+  applyAppleEmoji(inputEl);
+  _restoreCursorOffset(inputEl, saved);
+}
+
+// Global observer: replaces emoji in ANY new DOM content automatically.
+// Only exception: #chat-input, which uses _applyEmojiToInputSafe for cursor preservation.
+function _setupGlobalEmojiObserver() {
+  const obs = new MutationObserver(mutations => {
+    const toProcess = new Set();
+    for (const mut of mutations) {
+      for (const node of mut.addedNodes) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          if (node.nodeName === "IMG" && node.classList.contains("emoji")) continue;
+          toProcess.add(node);
+        } else if (node.nodeType === Node.TEXT_NODE && node.parentElement) {
+          toProcess.add(node.parentElement);
+        }
+      }
+    }
+    for (const el of toProcess) {
+      if (el.id === "chat-input" || el.closest?.("#chat-input")) continue;
+      _applyEmojiDirect(el);
+    }
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
 }
 
 function initEmojiPicker() {
@@ -2945,10 +3188,9 @@ function initEmojiPicker() {
       `<div class="emoji-section" data-section="${i}">` +
       `<div class="emoji-section-label">${cat.name}</div>` +
       `<div class="emoji-section-grid">` +
-      cat.emojis.map(e => `<button class="emoji-cell" data-emoji="${e}">${e}</button>`).join("") +
+      cat.emojis.map(e => `<button class="emoji-cell" data-emoji="${escapeAttr(e)}">${_emojiImgHtml(e)}</button>`).join("") +
       `</div></div>`
     ).join("");
-    applyAppleEmoji(bodyEl);
   }
 
   // Bind category tabs so they scroll to the matching section;
@@ -2982,7 +3224,7 @@ function initEmojiPicker() {
   hoverPopup.style.display = "none";
 
   const hpTabsHtml = EMOJI_CATEGORIES.map((c, i) =>
-    `<button class="emoji-tab${i === 0 ? " active" : ""}" data-cat="${i}" title="${c.name}">${c.icon}</button>`
+    `<button class="emoji-tab${i === 0 ? " active" : ""}" data-cat="${i}" title="${c.name}">${_emojiImgHtml(c.icon)}</button>`
   ).join("");
   hoverPopup.innerHTML = `
     <div class="emoji-dock-header">
@@ -2991,7 +3233,6 @@ function initEmojiPicker() {
     <div class="emoji-hover-body" id="emoji-hover-body"></div>
   `;
   document.body.appendChild(hoverPopup);
-  applyAppleEmoji(hoverPopup.querySelector(".emoji-tabs"));
   _renderAllEmojis(document.getElementById("emoji-hover-body"));
   _bindTabNav(
     document.getElementById("emoji-hp-tabs"),
@@ -3016,7 +3257,7 @@ function initEmojiPicker() {
   dock.style.display = "none";
 
   const dockTabsHtml = EMOJI_CATEGORIES.map((c, i) =>
-    `<button class="emoji-tab${i === 0 ? " active" : ""}" data-cat="${i}" title="${c.name}">${c.icon}</button>`
+    `<button class="emoji-tab${i === 0 ? " active" : ""}" data-cat="${i}" title="${c.name}">${_emojiImgHtml(c.icon)}</button>`
   ).join("");
   dock.innerHTML = `
     <div class="emoji-dock-header">
@@ -3033,7 +3274,6 @@ function initEmojiPicker() {
 
   const dockBodyEl = document.getElementById("emoji-dock-body");
   const dockTabsEl = document.getElementById("emoji-dock-tabs");
-  applyAppleEmoji(dock.querySelector(".emoji-tabs"));
   _renderAllEmojis(dockBodyEl);
   _bindTabNav(dockTabsEl, dockBodyEl);
 
@@ -3062,9 +3302,8 @@ function initEmojiPicker() {
     const results = _EMOJI_SEARCH.filter(({ n }) => n.includes(q));
     dockBodyEl.innerHTML = results.length
       ? `<div class="emoji-section-grid">${results.map(({ e }) =>
-          `<button class="emoji-cell" data-emoji="${e}">${e}</button>`).join("")}</div>`
+          `<button class="emoji-cell" data-emoji="${escapeAttr(e)}">${_emojiImgHtml(e)}</button>`).join("")}</div>`
       : `<div class="emoji-no-results">Nothing found for "${q}"</div>`;
-    if (results.length) applyAppleEmoji(dockBodyEl);
   });
 
   document.getElementById("emoji-dock-close").addEventListener("click", () => {
@@ -3125,6 +3364,7 @@ function setupEmojiBtn() {
 
 initFormatMenu();
 initEmojiPicker();
+_setupGlobalEmojiObserver();
 initMessageContextMenu();
 initLightbox();
 

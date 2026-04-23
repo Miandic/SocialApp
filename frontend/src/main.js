@@ -1,13 +1,17 @@
 import { auth, posts, users, messenger, notifications, media } from "./api.js";
 
-// ─── Simple SPA router ───
+// ─── Global state ───────────────────────────────────────────────────────────
 
-let currentUser = null; // cached /me response
-let ws = null; // WebSocket connection
-let currentChatId = null; // currently open chat
-let lastReadByChat = {}; // { chatId: { userId: messageId } }
-let notifPollTimer = null;
-let pendingAttachments = []; // [{kind:"media"|"file", file, thumb, objectUrl}]
+let currentUser = null;        // Cached /me response; null when logged out
+let ws = null;                 // Active WebSocket connection (or null)
+let currentChatId = null;      // ID of the currently open chat, null on other pages
+let lastReadByChat = {};        // { chatId: { userId: messageId } } — read receipts
+let notifPollTimer = null;     // setInterval handle for notification badge polling
+let pendingAttachments = [];   // Queued attachments before send: [{kind, file, thumb, objectUrl}]
+
+// ─── SPA router ─────────────────────────────────────────────────────────────
+// navigate(page, params) swaps the page by calling the matching render function.
+// Params are passed via window.__params so render functions can read them.
 
 const routes = {
   login: renderLogin,
@@ -162,7 +166,7 @@ function handleWsMessage(msg) {
       // Reserved for E2E — ignore for now
       break;
     default:
-      console.log("[WS] Unhandled:", msg);
+      console.warn("[WS] Unhandled message type:", msg.type, msg);
   }
 }
 
@@ -278,6 +282,9 @@ function updateReadReceipts() {
   }
 }
 
+// ─── Unread badge sync ───────────────────────────────────────────────────────
+// Reconciles sidebar unread badges against the latest chat list from the server.
+// The currently open chat always shows 0 (messages are considered read immediately).
 function syncBadges(chats) {
   for (const chat of chats) {
     const item = document.querySelector(`[data-chat-id="${chat.id}"]`);
@@ -832,7 +839,14 @@ function renderNotifText(n) {
   }
 }
 
-// ─── Chats ───
+// ─── Chats ───────────────────────────────────────────────────────────────────
+//
+// Page structure:
+//   renderChats()      — builds the two-column layout (sidebar + main area)
+//   loadChatList()     — fetches /chats and populates the sidebar list
+//   openChat(id)       — loads a specific chat: header, message history, input
+//   renderMessage()    — produces the HTML string for a single message bubble
+//   appendMessage()    — appends a new message to the open chat (called on WS event)
 
 async function renderChats(container) {
   if (!currentUser) {
@@ -921,6 +935,9 @@ function getChatDisplayName(chat) {
   return "Chat";
 }
 
+// Opens a chat by ID: resets the main area, loads chat metadata + message history,
+// and wires up all event handlers (submit, paste, keydown, attach, emoji, lightbox).
+// Re-entrant safe: each call overwrites the previous DOM and event handlers via innerHTML.
 async function openChat(chatId) {
   currentChatId = chatId;
 
@@ -1358,7 +1375,20 @@ function showNewChatDialog() {
   document.getElementById("new-chat-username").focus();
 }
 
-// ─── Rich text: serialization / rendering ───
+// ─── Rich text: serialization / rendering ───────────────────────────────────
+//
+// Messages are stored as JSON on the server and sent over WebSocket as the
+// `encrypted_content` field (name is a legacy placeholder — no encryption yet).
+//
+// Format: JSON array of span objects: [{t: "text", s: style | [styles] | null}]
+//   t  — text content (emoji stored as Unicode chars, e.g. "😀")
+//   s  — null (plain), string (single style), or array (multiple styles)
+//
+// Supported styles: "bold", "italic", "rainbow", "wave", "type", "font:Name"
+//
+// serializeRichText(el)  — DOM → JSON string (called on submit)
+// renderRichText(json)   — JSON string → HTML string (called when rendering messages)
+// extractPlainText(json) — JSON string → plain text preview (used in sidebar)
 
 function serializeRichText(el) {
   const spans = [];
@@ -2440,7 +2470,7 @@ async function getImageDimensions(file) {
   });
 }
 
-// ─── Helpers ───
+// ─── DOM / string helpers ─────────────────────────────────────────────────────
 
 function escapeHtml(str) {
   if (str == null) return "";
@@ -2470,10 +2500,42 @@ function toast(msg) {
   setTimeout(() => el.remove(), 2800);
 }
 
-// ─── Emoji Picker ───
+// ─── Emoji system ───────────────────────────────────────────────────────────
+//
+// ARCHITECTURE OVERVIEW
+// ─────────────────────
+// DATA LAYER (static, populated at module load)
+//   _EMOJI_RAW           Master list: [emoji, name, category_idx, shortcode?]
+//                        category_idx: 0=Smileys 1=People 2=Animals 3=Food
+//                                      4=Travel 5=Activities 6=Objects 7=Symbols
+//   EMOJI_CATEGORIES     Built from _EMOJI_RAW: [{name, icon, emojis[]}]
+//   EMOJI_SHORTCODE_MAP  { "smile": "😊", ... } for :shortcode: → emoji lookup
+//   _EMOJI_SEARCH        Flat [{e, n}] array used by the search input
+//
+// RENDERING HELPERS (pure functions, no side effects)
+//   _initEmojiRegex()          Lazy-builds codepoint cache + regex from _EMOJI_RAW
+//   _makeEmojiImg(emoji)   →   <img> DOM element ready for insertion
+//   _emojiImgHtml(emoji)   →   HTML string version (for innerHTML generation)
+//   _applyEmojiDirect(el)      Walks text nodes, replaces emoji chars with <img>
+//   applyAppleEmoji(el)        Twemoji.parse wrapper — used only for the input
+//                              field where it runs alongside cursor preservation
+//
+// CHAT INPUT FIELD
+//   _emojiInsert(emoji)            Insert Apple <img> at the current cursor position
+//   tryEmojiShortcode(el)          On each keystroke: detect ":name:" → emoji
+//   undoEmojiConversion()          Backspace immediately after shortcode conversion
+//   _saveCursorOffset(root)        Save cursor position as a logical char offset
+//   _restoreCursorOffset(root, n)  Restore cursor after DOM has been rewritten
+//   _applyEmojiToInputSafe(el)     applyAppleEmoji with cursor preservation
+//
+// PICKER UI (created once, reused)
+//   initEmojiPicker()            Build hover popup + docked panel; bind events
+//   setupEmojiBtn()              Wire the emoji button for the current chat view
+//   _setupGlobalEmojiObserver()  MutationObserver — auto-replaces emoji in any
+//                                new DOM content site-wide (messages, previews, etc.)
+// ────────────────────────────────────────────────────────────────────────────
 
 // [emoji, name, category_idx, shortcode?]
-// 0=Smileys 1=People 2=Animals 3=Food 4=Travel 5=Activities 6=Objects 7=Symbols
 const _EMOJI_RAW = [
   // ── Smileys & Emotion ──
   ["😀","grinning face",0,"grinning"],["😃","grinning face with big eyes",0,"smiley"],
@@ -2870,18 +2932,40 @@ function _initEmojiRegex() {
   _emojiRegex = new RegExp(sorted.join("|"), "gu");
 }
 
-// Returns the <img> HTML for a single emoji char.
-function _emojiImgHtml(emoji) {
-  if (typeof twemoji === "undefined") return escapeHtml(emoji);
+// Creates a DOM <img> element for a single emoji char (Apple 64px sprite).
+// Single source of truth for emoji image construction — all other helpers
+// (_emojiImgHtml, _emojiInsert, tryEmojiShortcode) delegate here.
+function _makeEmojiImg(emoji) {
   _initEmojiRegex();
   const cp = (_emojiCpCache && _emojiCpCache.has(emoji))
     ? _emojiCpCache.get(emoji)
     : twemoji.convert.toCodePoint(emoji);
-  return `<img src="/emoji/apple/64/${cp}.png" alt="${escapeAttr(emoji)}" class="emoji" draggable="false">`;
+  const img = document.createElement("img");
+  img.src = `/emoji/apple/64/${cp}.png`;
+  img.alt = emoji;           // stored as Unicode for serialization (serializeRichText reads .alt)
+  img.className = "emoji";
+  img.setAttribute("draggable", "false");
+  return img;
+}
+
+// Returns the outerHTML string of the Apple emoji <img> — for use in innerHTML generation.
+function _emojiImgHtml(emoji) {
+  if (typeof twemoji === "undefined") return escapeHtml(emoji);
+  return _makeEmojiImg(emoji).outerHTML;
+}
+
+// Moves the cursor (Selection) to immediately after `node`.
+function _placeCursorAfter(node, sel) {
+  const r = document.createRange();
+  r.setStartAfter(node);
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
 }
 
 // Walks every text node in `el`, replaces known emoji with Apple <img> elements.
-// More reliable than twemoji.parse for newer Unicode emoji not in Twemoji 14's regex.
+// Used instead of twemoji.parse because Twemoji 14's compiled regex doesn't cover
+// Unicode 15 emoji (🫨 etc.) — _makeEmojiImg works for any emoji via pure math.
 function _applyEmojiDirect(el) {
   if (!el || typeof twemoji === "undefined") return;
   _initEmojiRegex();
@@ -2900,15 +2984,8 @@ function _applyEmojiDirect(el) {
     let m;
     while ((m = _emojiRegex.exec(text)) !== null) {
       if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-      const emoji = m[0];
-      const cp = _emojiCpCache.get(emoji) || twemoji.convert.toCodePoint(emoji);
-      const img = document.createElement("img");
-      img.src = `/emoji/apple/64/${cp}.png`;
-      img.alt = emoji;
-      img.className = "emoji";
-      img.setAttribute("draggable", "false");
-      frag.appendChild(img);
-      last = m.index + emoji.length;
+      frag.appendChild(_makeEmojiImg(m[0]));
+      last = m.index + m[0].length;
     }
     if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
     node.replaceWith(frag);
@@ -2926,13 +3003,16 @@ function applyAppleEmoji(el) {
   });
 }
 
+// Inserts an Apple emoji <img> at the current cursor position inside #chat-input.
+// Falls back to plain Unicode text if Twemoji isn't loaded (shouldn't happen in prod).
 function _emojiInsert(emoji) {
   const inputEl = document.getElementById("chat-input");
   if (!inputEl) return;
   inputEl.focus();
   const sel = window.getSelection();
   if (!sel) return;
-  // Ensure there is a selection inside the input field
+
+  // Use the existing cursor if it's inside the input; otherwise place it at the end.
   let range;
   if (sel.rangeCount && inputEl.contains(sel.getRangeAt(0).startContainer)) {
     range = sel.getRangeAt(0);
@@ -2943,24 +3023,17 @@ function _emojiInsert(emoji) {
     sel.removeAllRanges();
     sel.addRange(range);
   }
+
   if (typeof twemoji !== "undefined") {
-    const cp = twemoji.convert.toCodePoint(emoji);
-    const img = document.createElement("img");
-    img.src = `/emoji/apple/64/${cp}.png`;
-    img.alt = emoji;
-    img.className = "emoji";
-    img.setAttribute("draggable", "false");
+    const img = _makeEmojiImg(emoji);
     range.deleteContents();
     range.insertNode(img);
-    const after = document.createRange();
-    after.setStartAfter(img);
-    after.collapse(true);
-    sel.removeAllRanges();
-    sel.addRange(after);
+    _placeCursorAfter(img, sel);
   } else {
     document.execCommand("insertText", false, emoji);
   }
-  // Fire input so the typing indicator and hasText checks stay correct
+
+  // Notify oninput so the typing indicator and hasText check stay in sync.
   inputEl.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
@@ -2974,6 +3047,9 @@ function _positionEmojiDock() {
   dock.style.height = `${r.height}px`;
 }
 
+// Called from oninput: checks if the text immediately before the cursor matches
+// ":shortcode:" and, if so, replaces it with an Apple emoji <img>.
+// Sets _emojiLastConversion so the user can Backspace to undo the substitution.
 function tryEmojiShortcode(inputEl) {
   if (_emojiConverting) return;
   const sel = window.getSelection();
@@ -2982,34 +3058,25 @@ function tryEmojiShortcode(inputEl) {
   if (!range.collapsed) return;
   const node = range.endContainer;
   if (node.nodeType !== Node.TEXT_NODE) return;
+
   const textBefore = node.textContent.substring(0, range.endOffset);
   const match = textBefore.match(/:(\w+):$/);
   if (!match) return;
   const emoji = EMOJI_SHORTCODE_MAP[match[1]];
   if (!emoji) return;
+
   const fullMatch = match[0];
-  const startOffset = range.endOffset - fullMatch.length;
   const replaceRange = document.createRange();
-  replaceRange.setStart(node, startOffset);
+  replaceRange.setStart(node, range.endOffset - fullMatch.length);
   replaceRange.setEnd(node, range.endOffset);
 
   if (typeof twemoji !== "undefined") {
-    // Insert Apple <img> directly — no execCommand needed, no extra oninput
-    const cp = twemoji.convert.toCodePoint(emoji);
-    const img = document.createElement("img");
-    img.src = `/emoji/apple/64/${cp}.png`;
-    img.alt = emoji;
-    img.className = "emoji";
-    img.setAttribute("draggable", "false");
+    const img = _makeEmojiImg(emoji);
     replaceRange.deleteContents();
     replaceRange.insertNode(img);
-    const after = document.createRange();
-    after.setStartAfter(img);
-    after.collapse(true);
-    sel.removeAllRanges();
-    sel.addRange(after);
+    _placeCursorAfter(img, sel);
   } else {
-    // Fallback: insert Unicode char via execCommand
+    // Fallback when Twemoji isn't available: insert Unicode char via execCommand.
     sel.removeAllRanges();
     sel.addRange(replaceRange);
     _emojiConverting = true;
@@ -3079,9 +3146,16 @@ function undoEmojiConversion() {
   return false;
 }
 
-// ─── Cursor-preserving Twemoji application for the chat input field ───
-// Counts "logical characters" up to the cursor (text chars + emoji-img counted
-// by their alt string's length so JS-string offsets stay consistent).
+// ─── Cursor preservation helpers ─────────────────────────────────────────────
+// When applyAppleEmoji (Twemoji.parse) rewrites text nodes containing emoji it
+// destroys any live Selection that points into those nodes. To recover, we
+// snapshot the cursor position as a "logical character offset" before the call
+// and then walk the updated DOM to find the same position afterwards.
+//
+// Logical char offset: number of Unicode chars consumed, where each emoji <img>
+// counts as the length of its .alt string (the original Unicode char sequence).
+// This keeps the offset stable across the text-node → <img> replacement.
+
 function _saveCursorOffset(root) {
   const sel = window.getSelection();
   if (!sel || !sel.rangeCount) return -1;
@@ -3143,7 +3217,10 @@ function _restoreCursorOffset(root, savedOffset) {
   sel.addRange(r);
 }
 
-// Apply Twemoji to `inputEl` while keeping the cursor in the same logical position.
+// Runs applyAppleEmoji on the input field while keeping the cursor in its current
+// logical position. Needed because Twemoji.parse rewrites text nodes, which
+// invalidates any live Selection pointing into them.
+// If the input doesn't have focus, cursor preservation is skipped (no selection to save).
 function _applyEmojiToInputSafe(inputEl) {
   if (document.activeElement !== inputEl) {
     applyAppleEmoji(inputEl);

@@ -99,7 +99,10 @@ impl PostsRepo {
         Ok(exists)
     }
 
-    /// Chronological feed: posts from users you follow, cursor-based pagination.
+    /// Chronological feed: own posts + posts from followed users, cursor-based pagination.
+    /// The OR condition is wrapped in parens so the AND created_at < $2 applies to both
+    /// branches — without parens, SQL operator precedence (AND > OR) would skip the
+    /// date filter for followed-user posts and break pagination.
     pub async fn feed(
         pool: &PgPool,
         user_id: Uuid,
@@ -110,9 +113,9 @@ impl PostsRepo {
         let posts = sqlx::query_as::<_, PostRow>(
             r#"
             SELECT p.* FROM posts p
-            WHERE p.author_id IN (SELECT following_id FROM follows WHERE follower_id = $1)
-               OR p.author_id = $1
-            AND p.created_at < $2
+            WHERE (p.author_id IN (SELECT following_id FROM follows WHERE follower_id = $1)
+                OR p.author_id = $1)
+              AND p.created_at < $2
             ORDER BY p.created_at DESC
             LIMIT $3
             "#,
@@ -125,7 +128,8 @@ impl PostsRepo {
         Ok(posts)
     }
 
-    /// Posts by a specific user.
+    /// Posts by a specific user — will back the `/users/{username}/posts` endpoint.
+    #[allow(dead_code)]
     pub async fn user_posts(
         pool: &PgPool,
         author_id: Uuid,

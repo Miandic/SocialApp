@@ -62,7 +62,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid, userna
     // Task: forward hub messages → WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = hub_rx.recv().await {
-            let text = serde_json::to_string(&msg).unwrap_or_default();
+            let text = match serde_json::to_string(&msg) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to serialize WS message: {e}");
+                    continue;
+                }
+            };
             if sender.send(Message::Text(text.into())).await.is_err() {
                 break;
             }
@@ -102,6 +108,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid, userna
 
     state.hub.unregister(user_id).await;
     tracing::info!("WebSocket disconnected: {username} ({user_id})");
+}
+
+/// Fetches all member IDs for a chat. Returns an empty vec and logs on error.
+async fn chat_member_ids(state: &AppState, chat_id: Uuid) -> Vec<Uuid> {
+    match MessengerRepo::get_chat_members(&state.db, chat_id).await {
+        Ok(members) => members.iter().map(|m| m.user_id).collect(),
+        Err(e) => {
+            tracing::error!("Failed to fetch members for chat {chat_id}: {e}");
+            vec![]
+        }
+    }
 }
 
 async fn handle_client_message(
@@ -153,12 +170,7 @@ async fn handle_client_message(
                 }
             };
 
-            // Get all chat members and broadcast
-            let members = MessengerRepo::get_chat_members(&state.db, chat_id)
-                .await
-                .unwrap_or_default();
-
-            let member_ids: Vec<Uuid> = members.iter().map(|m| m.user_id).collect();
+            let member_ids = chat_member_ids(state, chat_id).await;
 
             let server_msg = WsServerMessage::NewMessage {
                 id: stored.id,
@@ -175,14 +187,10 @@ async fn handle_client_message(
         }
 
         WsClientMessage::Typing { chat_id } => {
-            let members = MessengerRepo::get_chat_members(&state.db, chat_id)
+            let other_ids: Vec<Uuid> = chat_member_ids(state, chat_id)
                 .await
-                .unwrap_or_default();
-
-            let other_ids: Vec<Uuid> = members
-                .iter()
-                .filter(|m| m.user_id != sender_id)
-                .map(|m| m.user_id)
+                .into_iter()
+                .filter(|&id| id != sender_id)
                 .collect();
 
             hub.send_to_users(
@@ -200,18 +208,14 @@ async fn handle_client_message(
             chat_id,
             message_id,
         } => {
-            let members = MessengerRepo::get_chat_members(&state.db, chat_id)
-                .await
-                .unwrap_or_default();
-
             if let Err(e) = MessengerRepo::update_last_read(&state.db, chat_id, sender_id, message_id).await {
                 tracing::warn!("Failed to update last read: {e}");
             }
 
-            let other_ids: Vec<Uuid> = members
-                .iter()
-                .filter(|m| m.user_id != sender_id)
-                .map(|m| m.user_id)
+            let other_ids: Vec<Uuid> = chat_member_ids(state, chat_id)
+                .await
+                .into_iter()
+                .filter(|&id| id != sender_id)
                 .collect();
 
             hub.send_to_users(
@@ -283,11 +287,7 @@ async fn handle_client_message(
                 return;
             }
 
-            let members = MessengerRepo::get_chat_members(&state.db, chat_id)
-                .await
-                .unwrap_or_default();
-            let member_ids: Vec<Uuid> = members.iter().map(|m| m.user_id).collect();
-
+            let member_ids = chat_member_ids(state, chat_id).await;
             hub.send_to_users(
                 &member_ids,
                 WsServerMessage::MessageDeleted { chat_id, message_id },

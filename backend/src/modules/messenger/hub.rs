@@ -44,6 +44,8 @@ impl ConnectionHub {
         let conns = self.connections.read().await;
         if let Some(senders) = conns.get(&user_id) {
             for tx in senders {
+                // Err means the receiver (WebSocket task) has already dropped — the
+                // connection was closed. unregister() will prune it on disconnect.
                 let _ = tx.send(msg.clone());
             }
         }
@@ -55,7 +57,7 @@ impl ConnectionHub {
         for uid in user_ids {
             if let Some(senders) = conns.get(uid) {
                 for tx in senders {
-                    let _ = tx.send(msg.clone());
+                    let _ = tx.send(msg.clone()); // see send_to_user for why Err is ignored
                 }
             }
         }

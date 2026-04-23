@@ -53,6 +53,9 @@ pub struct UserInfo {
 
 // ─── DB row ───
 
+// sqlx::FromRow structs must match the full DB schema; not all fields are read
+// in application code but they must be present for the query macro to compile.
+#[allow(dead_code)]
 #[derive(Debug, sqlx::FromRow)]
 pub struct UserRow {
     pub id: Uuid,
@@ -62,7 +65,7 @@ pub struct UserRow {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub bio: Option<String>,
-    pub is_verified: bool,
+    pub is_verified: bool, // reserved — email verification not yet implemented
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -82,6 +85,7 @@ impl From<&UserRow> for UserInfo {
 
 // ─── Refresh token row ───
 
+#[allow(dead_code)] // fields needed for full row deserialization; validation happens via SQL WHERE
 #[derive(Debug, sqlx::FromRow)]
 pub struct RefreshTokenRow {
     pub id: Uuid,
@@ -95,5 +99,5 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 static USERNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[a-zA-Z0-9_]+$").unwrap()
+    Regex::new(r"^[a-zA-Z0-9_]+$").expect("USERNAME_RE is a hardcoded valid regex")
 });

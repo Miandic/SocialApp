@@ -7,6 +7,10 @@ use super::models::NotificationRow;
 pub struct NotificationsRepo;
 
 impl NotificationsRepo {
+    /// Creates a notification record. Not yet called from handlers — notifications
+    /// will be triggered by backend events (follows, likes, mentions) once that
+    /// logic is wired up.
+    #[allow(dead_code)]
     pub async fn create(
         pool: &PgPool,
         user_id: Uuid,

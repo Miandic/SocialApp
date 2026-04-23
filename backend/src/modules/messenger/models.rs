@@ -141,6 +141,10 @@ pub struct ChatRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// All columns required for sqlx to deserialize the full DB row.
+/// `last_read_message_id` / `last_read_at` are written via MarkRead and read
+/// in SQL subqueries (unread_count), but not accessed as struct fields in Rust.
+#[allow(dead_code)]
 #[derive(Debug, sqlx::FromRow)]
 pub struct ChatMemberRow {
     pub chat_id: Uuid,
@@ -162,6 +166,10 @@ pub struct MessageRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// E2E key bundle for Signal-protocol encryption (future feature).
+/// All columns needed for full row deserialization; `user_id` and `updated_at`
+/// are stored context, not accessed as struct fields after the query.
+#[allow(dead_code)]
 #[derive(Debug, sqlx::FromRow)]
 pub struct KeyBundleRow {
     pub user_id: Uuid,
@@ -171,6 +179,8 @@ pub struct KeyBundleRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One-time pre-key row for Signal-protocol handshake (future feature).
+#[allow(dead_code)] // struct only used as the query return type via sqlx
 #[derive(Debug, sqlx::FromRow)]
 pub struct OneTimePreKeyRow {
     pub id: Uuid,

@@ -31,6 +31,7 @@ pub enum TokenType {
 /// ```rust
 /// async fn protected(user: AuthUser) -> impl IntoResponse { ... }
 /// ```
+#[allow(dead_code)] // username available to handlers for display/logging without an extra DB query
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub user_id: Uuid,

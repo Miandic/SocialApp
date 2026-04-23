@@ -11,6 +11,7 @@ pub struct UpdateProfileRequest {
     #[validate(length(max = 500))]
     pub bio: Option<String>,
 
+    #[validate(url(message = "avatar_url must be a valid URL"), length(max = 2048))]
     pub avatar_url: Option<String>,
 }
 

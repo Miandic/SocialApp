@@ -7,6 +7,7 @@ use validator::Validate;
 pub struct CreatePostRequest {
     #[validate(length(min = 1, max = 5000, message = "Post content must be 1-5000 characters"))]
     pub content: String,
+    // Validated in the handler: each URL is checked individually, max 20 items.
     pub media_urls: Option<Vec<String>>,
 }
 
@@ -17,7 +18,7 @@ pub struct PostResponse {
     pub content: String,
     pub media_urls: Vec<String>,
     pub like_count: i32,
-    pub repost_count: i32,
+    pub repost_count: i32, // reserved — repost functionality not yet implemented
     pub is_liked: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -30,6 +31,7 @@ pub struct PostAuthor {
     pub avatar_url: Option<String>,
 }
 
+#[allow(dead_code)] // updated_at needed for full row deserialization; not read in handlers
 #[derive(Debug, sqlx::FromRow)]
 pub struct PostRow {
     pub id: Uuid,

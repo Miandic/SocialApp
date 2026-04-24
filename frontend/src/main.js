@@ -1,4 +1,16 @@
-import { auth, posts, users, messenger, notifications, media } from "./api.js";
+import { auth, posts, users, messenger, notifications, media, devices } from "./api.js";
+import {
+  loadOrCreateIdentityKeys,
+  generatePreKeys,
+  getIdentityPublicKeyBase64,
+  encryptForDevices,
+  decryptMessage,
+  preloadSession,
+  storeDeviceId,
+  loadDeviceId,
+  getDeviceName,
+  clearCryptoState,
+} from "./crypto.js";
 
 // ─── Global state ───────────────────────────────────────────────────────────
 
@@ -8,6 +20,20 @@ let currentChatId = null;      // ID of the currently open chat, null on other p
 let lastReadByChat = {};        // { chatId: { userId: messageId } } — read receipts
 let notifPollTimer = null;     // setInterval handle for notification badge polling
 let pendingAttachments = [];   // Queued attachments before send: [{kind, file, thumb, objectUrl}]
+
+// ─── E2EE device state ───────────────────────────────────────────────────────
+let currentDeviceId = null;    // UUID registered on server for this device
+// chatId → flat array of {device_id, identity_key, ...} for all participants
+let chatBundles = {};
+// chatId → timestamp (Date.now()) when bundles were last fetched
+let chatBundleTimestamps = {};
+// TTL for the bundle cache — bundles are re-fetched if older than this
+const BUNDLE_TTL_MS = 60_000; // 60 seconds
+// chatId → flat array of ChatMember objects (cached for bundle re-fetch on send)
+let chatMembers = {};
+// Set of message IDs already processed via WS — prevents duplicate renders
+// when the hub delivers the same message multiple times.
+const _handledMessageIds = new Set();
 
 // ─── SPA router ─────────────────────────────────────────────────────────────
 // navigate(page, params) swaps the page by calling the matching render function.
@@ -58,6 +84,10 @@ function renderHeader() {
       try { await auth.logout(); } catch {}
       auth.clearTokens();
       currentUser = null;
+      currentDeviceId = null;
+      chatBundles = {};
+      chatBundleTimestamps = {};
+      // Keys stay in IndexedDB — they'll be reloaded on next login
       navigate("login");
     };
     header.querySelectorAll("[data-page]").forEach((a) => {
@@ -101,9 +131,11 @@ function stopNotifPolling() {
 // ─── WebSocket management ───
 
 function connectWs() {
-  if (ws && ws.readyState === WebSocket.OPEN) return;
+  // Don't open a second socket while one is already connecting or open.
+  if (ws && ws.readyState <= WebSocket.OPEN) return; // CONNECTING=0, OPEN=1
+  if (!currentDeviceId) return; // no device registered yet
 
-  ws = messenger.connectWs();
+  ws = messenger.connectWs(currentDeviceId);
 
   ws.onopen = () => {
     console.log("[WS] Connected");
@@ -120,6 +152,11 @@ function connectWs() {
 
   ws.onclose = () => {
     console.log("[WS] Disconnected");
+    // Purge cached key bundles — they may be stale after a re-login or
+    // after a new device was registered. The next sendEncryptedMessage call
+    // will re-fetch fresh bundles automatically.
+    chatBundles = {};
+    chatBundleTimestamps = {};
     if (auth.isLoggedIn()) {
       setTimeout(connectWs, 3000);
     }
@@ -162,15 +199,113 @@ function handleWsMessage(msg) {
       console.warn("[WS] Error:", msg.message);
       toast(msg.message || "Server error");
       break;
-    case "key_bundle":
-      // Reserved for E2E — ignore for now
+    case "key_bundles":
+      // Handled inline via RequestKeyBundles WS flow — no-op here
+      break;
+    case "new_device_pending":
+      handleNewDevicePending(msg);
+      break;
+    case "device_approved":
+      handleDeviceApproved(msg);
+      break;
+    case "history_sync_ready":
+      handleHistorySyncReady(msg);
       break;
     default:
       console.warn("[WS] Unhandled message type:", msg.type, msg);
   }
 }
 
-function handleNewMessage(msg) {
+function handleNewDevicePending(msg) {
+  // Show a persistent banner on all existing verified devices
+  const existing = document.getElementById("pending-device-banner");
+  if (existing) existing.remove();
+
+  const banner = document.createElement("div");
+  banner.id = "pending-device-banner";
+  banner.className = "device-pending-banner";
+  banner.innerHTML = `
+    <span>New device "<strong>${escapeHtml(msg.device_name)}</strong>" is waiting for approval.</span>
+    <div class="device-pending-actions">
+      <button class="btn btn-sm" id="approve-device-btn">Approve</button>
+      <button class="btn btn-sm btn-outline" id="deny-device-btn">Deny</button>
+    </div>
+  `;
+  document.body.appendChild(banner);
+
+  document.getElementById("approve-device-btn").onclick = async () => {
+    try {
+      await devices.approve(msg.device_id);
+      banner.remove();
+      toast("Device approved. You can now start a history sync from Settings.");
+    } catch (e) {
+      toast(e.message || "Failed to approve device");
+    }
+  };
+  document.getElementById("deny-device-btn").onclick = async () => {
+    try {
+      await devices.revoke(msg.device_id);
+    } catch {}
+    banner.remove();
+  };
+}
+
+function handleDeviceApproved(msg) {
+  if (msg.device_id === currentDeviceId) {
+    // This device was approved — show history sync offer
+    showHistorySyncOffer();
+  }
+}
+
+function handleHistorySyncReady(msg) {
+  showHistoryDownloadBanner(msg.sender_device_id);
+}
+
+async function handleNewMessage(msg) {
+  // Deduplicate: the hub can deliver the same message multiple times if there
+  // were stale duplicate WS registrations for the same device.
+  if (_handledMessageIds.has(msg.id)) return;
+  _handledMessageIds.add(msg.id);
+  // Keep the set from growing unboundedly (keep last 500 IDs).
+  if (_handledMessageIds.size > 500) {
+    _handledMessageIds.delete(_handledMessageIds.values().next().value);
+  }
+
+  // Decrypt the message payload before rendering.
+  if (msg.encrypted_content && msg.encrypted_content !== "e2ee" && msg.nonce) {
+    // The WS frame now carries sender_identity_key so we can derive/re-derive
+    // the shared session on the fly without a separate REST call.
+    const inlineIdentityKey = msg.sender_identity_key || null;
+    try {
+      msg.encrypted_content = await decryptMessage(
+        msg.encrypted_content,
+        msg.nonce,
+        msg.sender_device_id,
+        inlineIdentityKey // null if already cached in IndexedDB, non-null → stores session too
+      );
+    } catch (e) {
+      // Still failed — fall back to fetching the full REST bundle.
+      console.warn("[E2EE] Decryption failed, fetching sender bundle:", e);
+      try {
+        const senderBundles = await devices.getUserBundles(msg.sender_id);
+        const senderBundle = senderBundles.find((b) => b.device_id === msg.sender_device_id);
+        if (senderBundle) {
+          msg.encrypted_content = await decryptMessage(
+            msg.encrypted_content,
+            msg.nonce,
+            msg.sender_device_id,
+            senderBundle.identity_key
+          );
+        } else {
+          msg.encrypted_content = "🔒 [encrypted]";
+        }
+      } catch (e2) {
+        console.warn("[E2EE] Retry decryption failed:", e2);
+        msg.encrypted_content = "🔒 [encrypted]";
+      }
+    }
+  }
+
   if (currentChatId === msg.chat_id) {
     appendMessage(msg);
     scrollMessagesDown();
@@ -282,6 +417,108 @@ function updateReadReceipts() {
   }
 }
 
+// ─── Device initialization ───────────────────────────────────────────────────
+
+/**
+ * Called after successful login or registration.
+ * Generates identity keys (or loads existing ones from IndexedDB) and registers
+ * this device on the server if not already registered.
+ */
+async function initializeDevice() {
+  await loadOrCreateIdentityKeys();
+
+  // Check if we already have a device ID in IndexedDB
+  const storedDeviceId = await loadDeviceId();
+
+  if (storedDeviceId) {
+    // Verify the stored device still exists on the server
+    try {
+      const deviceList = await devices.list();
+      const found = deviceList.find((d) => d.id === storedDeviceId);
+      if (found) {
+        currentDeviceId = storedDeviceId;
+        if (!found.is_verified) {
+          showDevicePendingStatus();
+        }
+        return;
+      }
+    } catch {}
+    // Device not found on server — re-register
+  }
+
+  // Register this device
+  const identityKey = await getIdentityPublicKeyBase64();
+  const { signedPreKey, signedPreKeySignature, oneTimePreKeys } = await generatePreKeys();
+
+  const result = await devices.register({
+    device_name: getDeviceName(),
+    identity_key: identityKey,
+    signed_pre_key: signedPreKey,
+    signed_pre_key_signature: signedPreKeySignature,
+    one_time_pre_keys: oneTimePreKeys,
+  });
+
+  currentDeviceId = result.device_id;
+  await storeDeviceId(currentDeviceId);
+
+  if (!result.is_verified) {
+    showDevicePendingStatus();
+  }
+}
+
+function showDevicePendingStatus() {
+  const existing = document.getElementById("device-pending-status");
+  if (existing) return;
+
+  const banner = document.createElement("div");
+  banner.id = "device-pending-status";
+  banner.className = "device-pending-banner device-pending-self";
+  banner.innerHTML = `
+    <span>⏳ This device is waiting for approval from one of your other devices.
+    Until approved, you can send messages but won't have access to message history.</span>
+  `;
+  document.body.appendChild(banner);
+}
+
+function showHistorySyncOffer() {
+  const existing = document.getElementById("device-pending-status");
+  if (existing) existing.remove();
+
+  const banner = document.createElement("div");
+  banner.id = "history-sync-offer";
+  banner.className = "device-pending-banner";
+  banner.innerHTML = `
+    <span>✅ Device approved! Your other device can now send you your message history.</span>
+    <button class="btn btn-sm" id="dismiss-sync-banner">Got it</button>
+  `;
+  document.body.appendChild(banner);
+  document.getElementById("dismiss-sync-banner").onclick = () => banner.remove();
+}
+
+function showHistoryDownloadBanner(senderDeviceId) {
+  const banner = document.createElement("div");
+  banner.className = "device-pending-banner";
+  banner.innerHTML = `
+    <span>📦 History sync available — downloading your message history...</span>
+  `;
+  document.body.appendChild(banner);
+
+  // Fetch and consume the history package
+  devices.getHistoryPackage(currentDeviceId)
+    .then(async (pkg) => {
+      if (!pkg) { banner.remove(); return; }
+      // History restore will be a Phase 2 feature;
+      // for now acknowledge receipt and delete the package
+      await devices.deleteHistoryPackage(currentDeviceId);
+      banner.innerHTML = `
+        <span>✅ History sync complete.</span>
+        <button class="btn btn-sm" id="close-sync-ok">Close</button>
+      `;
+      document.getElementById("close-sync-ok").onclick = () => banner.remove();
+    })
+    .catch(() => banner.remove());
+}
+
 // ─── Unread badge sync ───────────────────────────────────────────────────────
 // Reconciles sidebar unread badges against the latest chat list from the server.
 // The currently open chat always shows 0 (messages are considered read immediately).
@@ -332,6 +569,7 @@ function renderLogin(container) {
       });
       auth.setTokens(data.access_token, data.refresh_token);
       currentUser = data.user;
+      await initializeDevice();
       connectWs();
       startNotifPolling();
       navigate("feed");
@@ -385,6 +623,7 @@ function renderRegister(container) {
       });
       auth.setTokens(data.access_token, data.refresh_token);
       currentUser = data.user;
+      await initializeDevice();
       connectWs();
       startNotifPolling();
       navigate("feed");
@@ -885,12 +1124,114 @@ async function renderChats(container) {
   await loadChatList();
 }
 
+// ─── E2EE chat helpers ────────────────────────────────────────────────────────
+
+/**
+ * Fetch and cache key bundles for all members of a chat (including self).
+ * Pre-derives session keys so the first send is instant.
+ */
+async function loadChatBundles(chatId, members) {
+  const allBundles = [];
+  const userIds = [...new Set(members.map((m) => m.user_id))];
+
+  chatMembers[chatId] = members; // cache for re-fetch on send
+
+  for (const userId of userIds) {
+    try {
+      const bundles = await devices.getUserBundles(userId);
+      if (!Array.isArray(bundles) || bundles.length === 0) {
+        console.warn(`[E2EE] No verified devices for user ${userId}`);
+        continue;
+      }
+      for (const b of bundles) {
+        allBundles.push(b);
+        preloadSession(b.device_id, b.identity_key).catch((e) => {
+          console.warn(`[E2EE] Session preload failed for device ${b.device_id}:`, e);
+        });
+      }
+    } catch (e) {
+      console.error(`[E2EE] Failed to load bundles for user ${userId}:`, e);
+    }
+  }
+
+  chatBundles[chatId] = allBundles;
+  chatBundleTimestamps[chatId] = Date.now();
+  console.log(`[E2EE] Loaded ${allBundles.length} device bundles for chat ${chatId}`);
+}
+
+/**
+ * Decrypt a list of MessageResponse objects in-place.
+ * Messages that can't be decrypted get a placeholder text.
+ */
+async function decryptMessageList(messages) {
+  const result = [];
+  for (const msg of messages) {
+    const clone = { ...msg };
+    if (clone.encrypted_content && clone.encrypted_content !== "e2ee" && clone.nonce) {
+      try {
+        clone.encrypted_content = await decryptMessage(
+          clone.encrypted_content,
+          clone.nonce,
+          clone.sender_device_id,
+          null
+        );
+      } catch {
+        clone.encrypted_content = "🔒 [encrypted]";
+      }
+    }
+    result.push(clone);
+  }
+  return result;
+}
+
+/**
+ * Encrypt `plaintext` for every device in the current chat and send via WS.
+ * Falls back to plaintext if no key bundles are available (e.g. key server down).
+ */
+async function sendEncryptedMessage(chatId, plaintext, messageType = "text") {
+  let bundles = chatBundles[chatId] || [];
+  const bundleAge = Date.now() - (chatBundleTimestamps[chatId] || 0);
+
+  // Refresh if bundles are empty OR stale (> BUNDLE_TTL_MS). This handles the
+  // case where a chat partner just added a new device: within one TTL period
+  // we'll pick it up and start encrypting for it.
+  if ((bundles.length === 0 || bundleAge > BUNDLE_TTL_MS) && chatMembers[chatId]) {
+    if (bundles.length === 0) {
+      console.warn("[E2EE] Bundles not cached — loading before send");
+    } else {
+      console.log("[E2EE] Bundles stale — refreshing before send");
+    }
+    await loadChatBundles(chatId, chatMembers[chatId]);
+    bundles = chatBundles[chatId] || [];
+  }
+
+  if (bundles.length === 0) {
+    console.error("[E2EE] No device bundles available for chat", chatId);
+    toast("Cannot send: encryption keys not loaded. Try reopening the chat.");
+    return;
+  }
+
+  try {
+    const deviceCiphertexts = await encryptForDevices(plaintext, bundles);
+    sendWs({
+      type: "send_message",
+      chat_id: chatId,
+      device_ciphertexts: deviceCiphertexts,
+      message_type: messageType,
+    });
+  } catch (e) {
+    console.error("[E2EE] Encryption failed:", e);
+    toast("Failed to encrypt message");
+  }
+}
+
 async function loadChatList() {
   const listEl = document.getElementById("chat-list");
   if (!listEl) return;
 
   try {
-    const chats = await messenger.listChats();
+    // Pass device_id so the server returns per-device ciphertexts for last_message.
+    const chats = await messenger.listChats(currentDeviceId);
 
     if (chats.length === 0) {
       listEl.innerHTML = `
@@ -903,8 +1244,10 @@ async function loadChatList() {
 
     listEl.innerHTML = chats.map((chat) => {
       const name = getChatDisplayName(chat);
-      const preview = chat.last_message
-        ? `${chat.last_message.sender_username}: ${extractPlainText(chat.last_message.encrypted_content)}`
+      const lm = chat.last_message;
+      // Show a safe placeholder; decryption happens asynchronously below.
+      const preview = lm
+        ? `${lm.sender_username}: ${lm.encrypted_content === "e2ee" ? "💬" : "..."}`
         : "No messages yet";
       const active = currentChatId === chat.id ? " chat-item-active" : "";
       const unread = chat.unread_count || 0;
@@ -923,6 +1266,26 @@ async function loadChatList() {
     listEl.querySelectorAll(".chat-item").forEach((el) => {
       el.onclick = () => openChat(el.dataset.chatId);
     });
+
+    // Async pass: decrypt each last_message preview in the background.
+    for (const chat of chats) {
+      const lm = chat.last_message;
+      if (!lm || !lm.encrypted_content || lm.encrypted_content === "e2ee" || !lm.nonce) continue;
+      (async () => {
+        try {
+          const plaintext = await decryptMessage(
+            lm.encrypted_content, lm.nonce, lm.sender_device_id, null
+          );
+          const chatItem = listEl.querySelector(`[data-chat-id="${chat.id}"]`);
+          const previewEl = chatItem?.querySelector(".chat-preview");
+          if (previewEl) {
+            previewEl.textContent = `${lm.sender_username}: ${extractPlainText(plaintext)}`;
+          }
+        } catch {
+          // Session key not available yet — leave the placeholder.
+        }
+      })();
+    }
   } catch (err) {
     listEl.innerHTML = `<div class="error-msg" style="padding:16px">${err.message || "Failed to load chats"}</div>`;
   }
@@ -971,7 +1334,7 @@ async function openChat(chatId) {
   `;
 
   try {
-    const chats = await messenger.listChats();
+    const chats = await messenger.listChats(currentDeviceId);
     syncBadges(chats);
     const chat = chats.find((c) => c.id === chatId);
 
@@ -995,17 +1358,24 @@ async function openChat(chatId) {
       }
     }
 
-    const messages = await messenger.getMessages(chatId);
+    // Cache members and fetch key bundles for all chat members.
+    chatMembers[chatId] = chat.members;
+    await loadChatBundles(chatId, chat.members);
+
+    const messages = await messenger.getMessages(chatId, currentDeviceId);
     const messagesEl = document.getElementById("chat-messages");
 
-    if (messages.length === 0) {
+    // Decrypt all messages before rendering
+    const decrypted = await decryptMessageList(messages);
+
+    if (decrypted.length === 0) {
       messagesEl.innerHTML = `
         <div style="padding:20px;text-align:center;color:var(--text-muted)">
           No messages yet. Say hello!
         </div>
       `;
     } else {
-      const ordered = messages.slice().reverse();
+      const ordered = decrypted.slice().reverse();
       messagesEl.innerHTML = ordered.map((m, i) => renderMessage(m, i > 0 ? ordered[i - 1] : null)).join("");
       scrollMessagesDown();
 
@@ -1119,8 +1489,8 @@ async function openChat(chatId) {
         // Multiple media, or media + caption → gallery message
         await uploadAndSendGallery(mediaAtts, richText, chatId);
       } else if (richText) {
-        // Text only
-        sendWs({ type: "send_message", chat_id: chatId, encrypted_content: richText, nonce: "text-" + Date.now(), message_type: "text" });
+        // Text only — encrypt for all participant devices
+        await sendEncryptedMessage(chatId, richText, "text");
       }
     } finally {
       if (hasAttachments && btn) { btn.disabled = false; btn.textContent = "Send"; }
@@ -2337,7 +2707,7 @@ async function uploadAndSendAttachment(att, chatId) {
       ? JSON.stringify({ _type: "media", url, thumb: att.thumb, mime: att.file.type, name: att.file.name, size: uploadFile.size, w: att.w || 0, h: att.h || 0, gif_like: att.gifLike || false })
       : JSON.stringify({ _type: "file",  url, name: att.file.name, size: att.file.size, mime: att.file.type });
 
-    sendWs({ type: "send_message", chat_id: chatId, encrypted_content: payload, nonce: "media-nonce", message_type: att.kind });
+    await sendEncryptedMessage(chatId, payload, att.kind);
   } catch (err) {
     toast(`Upload failed: ${err.message || "unknown error"}`);
   }
@@ -2363,7 +2733,7 @@ async function uploadAndSendGallery(mediaAtts, captionJson, chatId) {
       };
     }));
     const payload = JSON.stringify({ _type: "gallery", items, caption: captionJson ?? null });
-    sendWs({ type: "send_message", chat_id: chatId, encrypted_content: payload, nonce: "gallery-" + Date.now(), message_type: "media" });
+    await sendEncryptedMessage(chatId, payload, "media");
   } catch (err) {
     toast(`Upload failed: ${err.message || "unknown error"}`);
   }
@@ -3453,11 +3823,12 @@ window.addEventListener("auth:logout", () => {
 });
 
 if (auth.isLoggedIn()) {
-  auth.me().then((user) => {
+  auth.me().then(async (user) => {
     currentUser = user;
+    await initializeDevice();
     connectWs();
     startNotifPolling();
-  }).catch(() => {});
+  }).catch(() => navigate("login"));
 }
 
 navigate(auth.isLoggedIn() ? "feed" : "login");

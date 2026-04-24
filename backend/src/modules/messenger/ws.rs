@@ -11,6 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::middleware::auth::{Claims, TokenType};
+use crate::modules::devices::DevicesRepo;
 use crate::state::AppState;
 
 use super::hub::ConnectionHub;
@@ -20,17 +21,18 @@ use super::repo::MessengerRepo;
 #[derive(Debug, Deserialize)]
 pub struct WsAuthQuery {
     pub token: String,
+    pub device_id: Uuid,
 }
 
 /// WebSocket upgrade handler.
-/// Browser WebSocket API cannot send custom headers, so we accept the JWT
-/// via query parameter: `/api/messenger/ws?token=<access_token>`
+///
+/// The browser WebSocket API cannot send custom headers, so credentials are
+/// passed via query params: `/api/messenger/ws?token=<jwt>&device_id=<uuid>`.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(query): Query<WsAuthQuery>,
 ) -> Result<impl IntoResponse, crate::errors::AppError> {
-    // Validate the token from query param
     let claims = decode::<Claims>(
         &query.token,
         &DecodingKey::from_secret(state.config.jwt_secret.as_bytes()),
@@ -45,21 +47,41 @@ pub async fn ws_handler(
         ));
     }
 
+    // Verify the claimed device belongs to this user
+    if !DevicesRepo::device_belongs_to_user(&state.db, query.device_id, claims.sub).await? {
+        return Err(crate::errors::AppError::Unauthorized(
+            "Device not registered for this account".into(),
+        ));
+    }
+
     let user_id = claims.sub;
+    let device_id = query.device_id;
     let username = claims.username;
 
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, username)))
+    Ok(ws.on_upgrade(move |socket| {
+        handle_socket(socket, state, user_id, device_id, username)
+    }))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid, username: String) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    user_id: Uuid,
+    device_id: Uuid,
+    username: String,
+) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Register this connection
-    let mut hub_rx = state.hub.register(user_id).await;
+    let mut hub_rx = state.hub.register(user_id, device_id).await;
 
-    tracing::info!("WebSocket connected: {username} ({user_id})");
+    // Update last_seen timestamp for this device
+    if let Err(e) = DevicesRepo::touch_last_seen(&state.db, device_id).await {
+        tracing::warn!("Failed to touch last_seen for device {device_id}: {e}");
+    }
 
-    // Task: forward hub messages → WebSocket
+    tracing::info!("WS connected: {username} / device {device_id}");
+
+    // Forward hub messages → WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = hub_rx.recv().await {
             let text = match serde_json::to_string(&msg) {
@@ -75,7 +97,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid, userna
         }
     });
 
-    // Task: receive WebSocket messages → process
+    // Receive WebSocket messages → process
     let hub = state.hub.clone();
     let recv_state = state.clone();
     let username_clone = username.clone();
@@ -88,6 +110,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid, userna
                             &recv_state,
                             &hub,
                             user_id,
+                            device_id,
                             &username_clone,
                             client_msg,
                         )
@@ -100,17 +123,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid, userna
         }
     });
 
-    // Wait for either task to finish
     tokio::select! {
         _ = send_task => {},
         _ = recv_task => {},
     }
 
-    state.hub.unregister(user_id).await;
-    tracing::info!("WebSocket disconnected: {username} ({user_id})");
+    state.hub.unregister(user_id, device_id).await;
+    tracing::info!("WS disconnected: {username} / device {device_id}");
 }
 
-/// Fetches all member IDs for a chat. Returns an empty vec and logs on error.
 async fn chat_member_ids(state: &AppState, chat_id: Uuid) -> Vec<Uuid> {
     match MessengerRepo::get_chat_members(&state.db, chat_id).await {
         Ok(members) => members.iter().map(|m| m.user_id).collect(),
@@ -125,17 +146,16 @@ async fn handle_client_message(
     state: &AppState,
     hub: &ConnectionHub,
     sender_id: Uuid,
+    sender_device_id: Uuid,
     sender_username: &str,
     msg: WsClientMessage,
 ) {
     match msg {
         WsClientMessage::SendMessage {
             chat_id,
-            encrypted_content,
-            nonce,
+            device_ciphertexts,
             message_type,
         } => {
-            // Verify membership
             if !MessengerRepo::is_chat_member(&state.db, chat_id, sender_id)
                 .await
                 .unwrap_or(false)
@@ -152,14 +172,13 @@ async fn handle_client_message(
 
             let msg_type = message_type.as_deref().unwrap_or("text");
 
-            // Store the encrypted message
-            let stored = match MessengerRepo::store_message(
+            let stored = match MessengerRepo::store_message_e2ee(
                 &state.db,
                 chat_id,
                 sender_id,
-                &encrypted_content,
-                &nonce,
+                sender_device_id,
                 msg_type,
+                &device_ciphertexts,
             )
             .await
             {
@@ -172,18 +191,53 @@ async fn handle_client_message(
 
             let member_ids = chat_member_ids(state, chat_id).await;
 
-            let server_msg = WsServerMessage::NewMessage {
-                id: stored.id,
-                chat_id,
-                sender_id,
-                sender_username: sender_username.to_string(),
-                encrypted_content: stored.encrypted_content,
-                nonce: stored.nonce,
-                message_type: stored.message_type,
-                created_at: stored.created_at,
-            };
+            // Fetch the sender's identity key once so every recipient can
+            // (re-)derive the shared session key without an extra REST call.
+            let sender_identity_key =
+                match DevicesRepo::get_device_identity_key(&state.db, sender_device_id).await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to fetch identity key for device {sender_device_id}: {e}"
+                        );
+                        String::new()
+                    }
+                };
 
-            hub.send_to_users(&member_ids, server_msg).await;
+            // Notify every online device.
+            // Devices with a matching ciphertext receive the decryptable content.
+            // Devices without one still get a notification (placeholder ciphertext)
+            // so the UI updates in real time; they'll see 🔒 and can re-fetch via REST.
+            for &member_id in &member_ids {
+                let online = hub.online_device_ids(member_id).await;
+                for online_device_id in online {
+                    let dc = device_ciphertexts
+                        .iter()
+                        .find(|dc| dc.device_id == online_device_id);
+
+                    hub.send_to_device(
+                        member_id,
+                        online_device_id,
+                        WsServerMessage::NewMessage {
+                            id: stored.id,
+                            chat_id,
+                            sender_id,
+                            sender_device_id,
+                            sender_username: sender_username.to_string(),
+                            sender_identity_key: sender_identity_key.clone(),
+                            encrypted_content: dc
+                                .map(|d| d.encrypted_content.clone())
+                                .unwrap_or_else(|| stored.encrypted_content.clone()),
+                            nonce: dc
+                                .map(|d| d.nonce.clone())
+                                .unwrap_or_else(|| stored.nonce.clone()),
+                            message_type: stored.message_type.clone(),
+                            created_at: stored.created_at,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
 
         WsClientMessage::Typing { chat_id } => {
@@ -208,7 +262,9 @@ async fn handle_client_message(
             chat_id,
             message_id,
         } => {
-            if let Err(e) = MessengerRepo::update_last_read(&state.db, chat_id, sender_id, message_id).await {
+            if let Err(e) =
+                MessengerRepo::update_last_read(&state.db, chat_id, sender_id, message_id).await
+            {
                 tracing::warn!("Failed to update last read: {e}");
             }
 
@@ -229,34 +285,10 @@ async fn handle_client_message(
             .await;
         }
 
-        WsClientMessage::UploadPreKeys {
-            identity_key,
-            signed_pre_key,
-            signed_pre_key_signature,
-            one_time_pre_keys,
+        WsClientMessage::DeleteMessage {
+            chat_id,
+            message_id,
         } => {
-            if let Err(e) = MessengerRepo::upsert_key_bundle(
-                &state.db,
-                sender_id,
-                &identity_key,
-                &signed_pre_key,
-                &signed_pre_key_signature,
-            )
-            .await
-            {
-                tracing::error!("Failed to store key bundle: {e}");
-                return;
-            }
-
-            if let Err(e) =
-                MessengerRepo::add_one_time_pre_keys(&state.db, sender_id, &one_time_pre_keys)
-                    .await
-            {
-                tracing::error!("Failed to store one-time pre-keys: {e}");
-            }
-        }
-
-        WsClientMessage::DeleteMessage { chat_id, message_id } => {
             if !MessengerRepo::is_chat_member(&state.db, chat_id, sender_id)
                 .await
                 .unwrap_or(false)
@@ -295,31 +327,21 @@ async fn handle_client_message(
             .await;
         }
 
-        WsClientMessage::RequestKeyBundle { user_id } => {
-            let bundle = MessengerRepo::get_key_bundle(&state.db, user_id).await;
-            match bundle {
-                Ok(Some(b)) => {
-                    let otpk = MessengerRepo::claim_one_time_pre_key(&state.db, user_id)
-                        .await
-                        .unwrap_or(None);
-
+        WsClientMessage::RequestKeyBundles { user_id } => {
+            match DevicesRepo::get_user_device_bundles(&state.db, user_id).await {
+                Ok(devices) => {
                     hub.send_to_user(
                         sender_id,
-                        WsServerMessage::KeyBundle {
-                            user_id,
-                            identity_key: b.identity_key,
-                            signed_pre_key: b.signed_pre_key,
-                            signed_pre_key_signature: b.signed_pre_key_signature,
-                            one_time_pre_key: otpk,
-                        },
+                        WsServerMessage::KeyBundles { user_id, devices },
                     )
                     .await;
                 }
-                _ => {
+                Err(e) => {
+                    tracing::error!("Failed to fetch key bundles for {user_id}: {e}");
                     hub.send_to_user(
                         sender_id,
                         WsServerMessage::Error {
-                            message: "Key bundle not found for user".into(),
+                            message: "Failed to fetch key bundles".into(),
                         },
                     )
                     .await;

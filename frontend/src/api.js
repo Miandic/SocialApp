@@ -95,18 +95,38 @@ export const posts = {
   feed: (params = "") => request("GET", `/posts/feed?${params}`),
 };
 
+// ─── Devices ───
+export const devices = {
+  register: (data) => request("POST", "/devices", data),
+  list: () => request("GET", "/devices"),
+  approve: (deviceId) => request("POST", `/devices/${deviceId}/approve`),
+  revoke: (deviceId) => request("DELETE", `/devices/${deviceId}`),
+  uploadPreKeys: (deviceId, data) => request("POST", `/devices/${deviceId}/pre-keys`, data),
+  getUserBundles: (userId) => request("GET", `/devices/user-bundles/${userId}`),
+  sendHistoryPackage: (data) => request("POST", "/devices/history-sync", data),
+  getHistoryPackage: (deviceId) => request("GET", `/devices/${deviceId}/history-sync`),
+  deleteHistoryPackage: (deviceId) => request("DELETE", `/devices/${deviceId}/history-sync`),
+};
+
 // ─── Messenger ───
 export const messenger = {
   createChat: (data) => request("POST", "/messenger/chats", data),
-  listChats: () => request("GET", "/messenger/chats"),
-  getMessages: (chatId, params = "") =>
-    request("GET", `/messenger/chats/${chatId}/messages?${params}`),
+  listChats: (deviceId) => {
+    const qs = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "";
+    return request("GET", `/messenger/chats${qs}`);
+  },
+  getMessages: (chatId, deviceId, params = "") => {
+    const qs = new URLSearchParams(params);
+    if (deviceId) qs.set("device_id", deviceId);
+    return request("GET", `/messenger/chats/${chatId}/messages?${qs}`);
+  },
 
-  connectWs: () => {
+  connectWs: (deviceId) => {
     const token = getToken();
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(
-      `${protocol}//${location.host}/api/messenger/ws?token=${encodeURIComponent(token)}`
+      `${protocol}//${location.host}/api/messenger/ws` +
+        `?token=${encodeURIComponent(token)}&device_id=${encodeURIComponent(deviceId)}`
     );
     return ws;
   },

@@ -3,87 +3,106 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
-// ─── WebSocket protocol messages ───
+use crate::modules::devices::DeviceKeyBundle;
 
-/// Client → Server messages
+// ─── WebSocket protocol ───
+
+/// One device's share of a message ciphertext. The sender encrypts the message
+/// separately for every recipient device and includes all results here.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DeviceCiphertext {
+    pub device_id: Uuid,
+    pub encrypted_content: String, // base64url AES-256-GCM ciphertext
+    pub nonce: String,             // base64url 12-byte IV
+}
+
+/// Client → Server
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsClientMessage {
-    /// Send an E2E encrypted message
+    /// Send an E2EE message. Includes one ciphertext entry per recipient device
+    /// (and the sender's own devices) so each device receives its own decryptable copy.
     SendMessage {
         chat_id: Uuid,
-        encrypted_content: String, // base64-encoded ciphertext
-        nonce: String,             // base64-encoded nonce
+        device_ciphertexts: Vec<DeviceCiphertext>,
         message_type: Option<String>,
     },
-    /// Mark messages as read
+    /// Mark messages as read up to this message.
     MarkRead {
         chat_id: Uuid,
         message_id: Uuid,
     },
-    /// Typing indicator
+    /// Typing indicator.
     Typing {
         chat_id: Uuid,
     },
-    /// Upload pre-keys for E2E key exchange
-    UploadPreKeys {
-        identity_key: String,
-        signed_pre_key: String,
-        signed_pre_key_signature: String,
-        one_time_pre_keys: Vec<String>,
-    },
-    /// Request someone's key bundle for starting an E2E session
-    RequestKeyBundle {
+    /// Request key bundles for all verified devices of a user (before first message).
+    RequestKeyBundles {
         user_id: Uuid,
     },
-    /// Delete a message (only sender can delete their own)
+    /// Delete a message (sender only).
     DeleteMessage {
         chat_id: Uuid,
         message_id: Uuid,
     },
 }
 
-/// Server → Client messages
+/// Server → Client
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsServerMessage {
-    /// New message received
+    /// Incoming message for this specific device.
     NewMessage {
         id: Uuid,
         chat_id: Uuid,
         sender_id: Uuid,
+        sender_device_id: Uuid,
         sender_username: String,
+        /// Base64-encoded X25519 identity public key of the sending device.
+        /// Recipients use this to derive (or re-derive) the shared session key
+        /// without an extra round-trip to the REST API.
+        sender_identity_key: String,
         encrypted_content: String,
         nonce: String,
         message_type: String,
         created_at: DateTime<Utc>,
     },
-    /// Someone is typing
+    /// Typing indicator from another participant.
     Typing {
         chat_id: Uuid,
         user_id: Uuid,
         username: String,
     },
-    /// Messages read receipt
+    /// Read receipt from another participant.
     MessagesRead {
         chat_id: Uuid,
         user_id: Uuid,
         last_read_message_id: Uuid,
     },
-    /// Key bundle response
-    KeyBundle {
+    /// Key bundles for all devices of the requested user.
+    KeyBundles {
         user_id: Uuid,
-        identity_key: String,
-        signed_pre_key: String,
-        signed_pre_key_signature: String,
-        one_time_pre_key: Option<String>,
+        devices: Vec<DeviceKeyBundle>,
     },
-    /// A message was deleted
+    /// A message was deleted.
     MessageDeleted {
         chat_id: Uuid,
         message_id: Uuid,
     },
-    /// Error
+    /// A new device on this account is waiting for approval.
+    NewDevicePending {
+        device_id: Uuid,
+        device_name: String,
+    },
+    /// A device has been approved by another device on this account.
+    DeviceApproved {
+        device_id: Uuid,
+    },
+    /// An encrypted history sync package is available for this device to fetch.
+    HistorySyncReady {
+        sender_device_id: Uuid,
+    },
+    /// Server-side error.
     Error {
         message: String,
     },
@@ -95,7 +114,7 @@ pub enum WsServerMessage {
 pub struct CreateChatRequest {
     #[validate(length(min = 1, message = "At least one member required"))]
     pub member_ids: Vec<Uuid>,
-    pub name: Option<String>, // required for group chats
+    pub name: Option<String>,
     pub is_group: Option<bool>,
 }
 
@@ -124,11 +143,26 @@ pub struct MessageResponse {
     pub id: Uuid,
     pub chat_id: Uuid,
     pub sender_id: Uuid,
+    pub sender_device_id: Option<Uuid>,
     pub sender_username: String,
     pub encrypted_content: String,
     pub nonce: String,
     pub message_type: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MessagesQuery {
+    pub before: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+    /// Device ID — used to pick the device-specific ciphertext from the DB.
+    pub device_id: Option<Uuid>,
+}
+
+impl MessagesQuery {
+    pub fn limit(&self) -> i64 {
+        self.limit.unwrap_or(50).clamp(1, 100)
+    }
 }
 
 // ─── DB rows ───
@@ -141,9 +175,6 @@ pub struct ChatRow {
     pub created_at: DateTime<Utc>,
 }
 
-/// All columns required for sqlx to deserialize the full DB row.
-/// `last_read_message_id` / `last_read_at` are written via MarkRead and read
-/// in SQL subqueries (unread_count), but not accessed as struct fields in Rust.
 #[allow(dead_code)]
 #[derive(Debug, sqlx::FromRow)]
 pub struct ChatMemberRow {
@@ -160,43 +191,9 @@ pub struct MessageRow {
     pub id: Uuid,
     pub chat_id: Uuid,
     pub sender_id: Uuid,
+    pub sender_device_id: Option<Uuid>,
     pub encrypted_content: String,
     pub nonce: String,
     pub message_type: String,
     pub created_at: DateTime<Utc>,
-}
-
-/// E2E key bundle for Signal-protocol encryption (future feature).
-/// All columns needed for full row deserialization; `user_id` and `updated_at`
-/// are stored context, not accessed as struct fields after the query.
-#[allow(dead_code)]
-#[derive(Debug, sqlx::FromRow)]
-pub struct KeyBundleRow {
-    pub user_id: Uuid,
-    pub identity_key: String,
-    pub signed_pre_key: String,
-    pub signed_pre_key_signature: String,
-    pub updated_at: DateTime<Utc>,
-}
-
-/// One-time pre-key row for Signal-protocol handshake (future feature).
-#[allow(dead_code)] // struct only used as the query return type via sqlx
-#[derive(Debug, sqlx::FromRow)]
-pub struct OneTimePreKeyRow {
-    pub id: Uuid,
-    pub user_id: Uuid,
-    pub key_data: String,
-    pub used: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MessagesQuery {
-    pub before: Option<DateTime<Utc>>,
-    pub limit: Option<i64>,
-}
-
-impl MessagesQuery {
-    pub fn limit(&self) -> i64 {
-        self.limit.unwrap_or(50).clamp(1, 100)
-    }
 }

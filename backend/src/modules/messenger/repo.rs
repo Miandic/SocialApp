@@ -3,6 +3,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::errors::AppResult;
+
 use super::models::*;
 
 pub struct MessengerRepo;
@@ -32,7 +33,8 @@ impl MessengerRepo {
         role: &str,
     ) -> AppResult<()> {
         sqlx::query(
-            "INSERT INTO chat_members (chat_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            "INSERT INTO chat_members (chat_id, user_id, role) VALUES ($1, $2, $3) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(chat_id)
         .bind(user_id)
@@ -78,7 +80,6 @@ impl MessengerRepo {
         Ok(exists)
     }
 
-    /// Find existing 1-on-1 chat between two users.
     pub async fn find_dm_chat(
         pool: &PgPool,
         user_a: Uuid,
@@ -101,52 +102,106 @@ impl MessengerRepo {
 
     // ─── Messages ───
 
-    pub async fn store_message(
+    /// Store a message with per-device ciphertexts in a single transaction.
+    /// The `messages` row uses placeholder values; real ciphertexts live in
+    /// `message_device_ciphertexts`.
+    pub async fn store_message_e2ee(
         pool: &PgPool,
         chat_id: Uuid,
         sender_id: Uuid,
-        encrypted_content: &str,
-        nonce: &str,
+        sender_device_id: Uuid,
         message_type: &str,
+        device_ciphertexts: &[DeviceCiphertext],
     ) -> AppResult<MessageRow> {
+        let mut tx = pool.begin().await?;
+
         let msg = sqlx::query_as::<_, MessageRow>(
             r#"
-            INSERT INTO messages (chat_id, sender_id, encrypted_content, nonce, message_type)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO messages (chat_id, sender_id, sender_device_id, message_type)
+            VALUES ($1, $2, $3, $4)
             RETURNING *
             "#,
         )
         .bind(chat_id)
         .bind(sender_id)
-        .bind(encrypted_content)
-        .bind(nonce)
+        .bind(sender_device_id)
         .bind(message_type)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        for dc in device_ciphertexts {
+            sqlx::query(
+                r#"
+                INSERT INTO message_device_ciphertexts (message_id, device_id, encrypted_content, nonce)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (message_id, device_id) DO NOTHING
+                "#,
+            )
+            .bind(msg.id)
+            .bind(dc.device_id)
+            .bind(&dc.encrypted_content)
+            .bind(&dc.nonce)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(msg)
     }
 
+    /// Fetch message history, attaching the device-specific ciphertext when `device_id`
+    /// is supplied.
     pub async fn get_messages(
         pool: &PgPool,
         chat_id: Uuid,
+        device_id: Option<Uuid>,
         before: Option<DateTime<Utc>>,
         limit: i64,
     ) -> AppResult<Vec<MessageRow>> {
         let before = before.unwrap_or_else(Utc::now);
-        let messages = sqlx::query_as::<_, MessageRow>(
-            r#"
-            SELECT * FROM messages
-            WHERE chat_id = $1 AND created_at < $2
-            ORDER BY created_at DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(chat_id)
-        .bind(before)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-        Ok(messages)
+        match device_id {
+            Some(did) => {
+                sqlx::query_as::<_, MessageRow>(
+                    r#"
+                    SELECT
+                        m.id, m.chat_id, m.sender_id, m.sender_device_id, m.message_type, m.created_at,
+                        COALESCE(mdc.encrypted_content, m.encrypted_content) AS encrypted_content,
+                        COALESCE(mdc.nonce, m.nonce) AS nonce
+                    FROM messages m
+                    LEFT JOIN message_device_ciphertexts mdc
+                        ON mdc.message_id = m.id AND mdc.device_id = $4
+                    WHERE m.chat_id = $1 AND m.created_at < $2
+                    ORDER BY m.created_at DESC
+                    LIMIT $3
+                    "#,
+                )
+                .bind(chat_id)
+                .bind(before)
+                .bind(limit)
+                .bind(did)
+                .fetch_all(pool)
+                .await
+                .map_err(Into::into)
+            }
+            None => {
+                sqlx::query_as::<_, MessageRow>(
+                    r#"
+                    SELECT id, chat_id, sender_id, sender_device_id, encrypted_content,
+                           nonce, message_type, created_at
+                    FROM messages
+                    WHERE chat_id = $1 AND created_at < $2
+                    ORDER BY created_at DESC
+                    LIMIT $3
+                    "#,
+                )
+                .bind(chat_id)
+                .bind(before)
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+                .map_err(Into::into)
+            }
+        }
     }
 
     pub async fn update_last_read(
@@ -190,7 +245,6 @@ impl MessengerRepo {
         Ok(count)
     }
 
-    /// Delete a message — only succeeds if `sender_id` matches the message author.
     pub async fn delete_message(
         pool: &PgPool,
         chat_id: Uuid,
@@ -208,90 +262,39 @@ impl MessengerRepo {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn get_last_message(pool: &PgPool, chat_id: Uuid) -> AppResult<Option<MessageRow>> {
-        let msg = sqlx::query_as::<_, MessageRow>(
-            "SELECT * FROM messages WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(chat_id)
-        .fetch_optional(pool)
-        .await?;
-        Ok(msg)
-    }
-
-    // ─── E2E Keys ───
-
-    pub async fn upsert_key_bundle(
+    pub async fn get_last_message(
         pool: &PgPool,
-        user_id: Uuid,
-        identity_key: &str,
-        signed_pre_key: &str,
-        signature: &str,
-    ) -> AppResult<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO user_key_bundles (user_id, identity_key, signed_pre_key, signed_pre_key_signature)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (user_id) DO UPDATE
-            SET identity_key = $2, signed_pre_key = $3, signed_pre_key_signature = $4, updated_at = NOW()
-            "#,
-        )
-        .bind(user_id)
-        .bind(identity_key)
-        .bind(signed_pre_key)
-        .bind(signature)
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn add_one_time_pre_keys(
-        pool: &PgPool,
-        user_id: Uuid,
-        keys: &[String],
-    ) -> AppResult<()> {
-        for key in keys {
-            sqlx::query(
-                "INSERT INTO one_time_pre_keys (user_id, key_data) VALUES ($1, $2)",
-            )
-            .bind(user_id)
-            .bind(key)
-            .execute(pool)
-            .await?;
-        }
-        Ok(())
-    }
-
-    pub async fn get_key_bundle(pool: &PgPool, user_id: Uuid) -> AppResult<Option<KeyBundleRow>> {
-        let bundle = sqlx::query_as::<_, KeyBundleRow>(
-            "SELECT * FROM user_key_bundles WHERE user_id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?;
-        Ok(bundle)
-    }
-
-    /// Claim one unused one-time pre-key (and mark it used).
-    pub async fn claim_one_time_pre_key(
-        pool: &PgPool,
-        user_id: Uuid,
-    ) -> AppResult<Option<String>> {
-        let key: Option<(String,)> = sqlx::query_as(
-            r#"
-            UPDATE one_time_pre_keys
-            SET used = TRUE
-            WHERE id = (
-                SELECT id FROM one_time_pre_keys
-                WHERE user_id = $1 AND used = FALSE
+        chat_id: Uuid,
+        device_id: Option<Uuid>,
+    ) -> AppResult<Option<MessageRow>> {
+        let msg = match device_id {
+            Some(did) => sqlx::query_as::<_, MessageRow>(
+                r#"
+                SELECT
+                    m.id, m.chat_id, m.sender_id, m.sender_device_id, m.message_type, m.created_at,
+                    COALESCE(mdc.encrypted_content, m.encrypted_content) AS encrypted_content,
+                    COALESCE(mdc.nonce, m.nonce) AS nonce
+                FROM messages m
+                LEFT JOIN message_device_ciphertexts mdc
+                    ON mdc.message_id = m.id AND mdc.device_id = $2
+                WHERE m.chat_id = $1
+                ORDER BY m.created_at DESC
                 LIMIT 1
-                FOR UPDATE SKIP LOCKED
+                "#,
             )
-            RETURNING key_data
-            "#,
-        )
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?;
-        Ok(key.map(|(k,)| k))
+            .bind(chat_id)
+            .bind(did)
+            .fetch_optional(pool)
+            .await?,
+            None => sqlx::query_as::<_, MessageRow>(
+                "SELECT id, chat_id, sender_id, sender_device_id, encrypted_content, \
+                 nonce, message_type, created_at \
+                 FROM messages WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?,
+        };
+        Ok(msg)
     }
 }

@@ -58,6 +58,7 @@ async fn main() {
     // Build router
     let app = Router::new()
         .nest("/api/auth", modules::auth::router())
+        .nest("/api/devices", modules::devices::router())
         .nest("/api/users", modules::users::router())
         .nest("/api/posts", modules::posts::router())
         .nest("/api/messenger", modules::messenger::router())

@@ -69,6 +69,9 @@ export const auth = {
   login: (data) => request("POST", "/auth/login", data),
   logout: () => request("POST", "/auth/logout"),
   me: () => request("GET", "/auth/me"),
+  /** Verify the current user's password server-side.
+   *  Resolves on success; throws on wrong password or network error. */
+  verifyPassword: (password) => request("POST", "/auth/verify-password", { password }),
   setTokens,
   clearTokens,
   getToken,

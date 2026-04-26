@@ -32,6 +32,11 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct VerifyPasswordRequest {
+    pub password: String,
+}
+
 // ─── Responses ───
 
 #[derive(Debug, Serialize)]

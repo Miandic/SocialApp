@@ -28,17 +28,26 @@ pub async fn register_device(
     req.validate().map_err(|e| AppError::Validation(e.to_string()))?;
 
     let has_devices = DevicesRepo::user_has_verified_devices(&state.db, auth.user_id).await?;
-    // Auto-verify if:
-    //  (a) the user has no verified devices at all — first device on the account, OR
-    //  (b) no verified device is currently online (nobody around to approve), OR
-    //  (c) the submitted identity_key already exists on a verified device — this is
-    //      a recovery-code restore: possession of the private key proves identity,
-    //      so we trust it regardless of online state or race conditions with WS teardown.
-    let is_online = state.hub.is_online(auth.user_id).await;
+    // A new device is auto-verified in exactly two cases:
+    //
+    //  (a) !has_devices — this is the very first device on the account.
+    //      There is nothing to compare against, so we trust it unconditionally.
+    //
+    //  (b) same_key_verified — the submitted identity_key matches the public key
+    //      of an already-verified device.  Possession of the corresponding private
+    //      key is proof of identity (recovery-code restore path).
+    //
+    // Importantly, "no verified device is currently online" is NOT a valid reason
+    // to auto-verify.  Accepting it would let anyone who knows the password register
+    // a fresh key as verified whenever all existing devices are offline, which breaks
+    // the E2EE guarantee: that device would be included in future message bundles
+    // and could read all subsequent messages without ever having the original key.
+    // If the user's existing devices are unavailable, the correct path is the
+    // recovery code — not automatic trust.
     let same_key_verified = DevicesRepo::has_verified_device_with_key(
         &state.db, auth.user_id, &req.identity_key,
     ).await?;
-    let is_verified = !has_devices || !is_online || same_key_verified;
+    let is_verified = !has_devices || same_key_verified;
 
     let device = DevicesRepo::create_device(
         &state.db,

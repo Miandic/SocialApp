@@ -12,6 +12,8 @@ import {
   clearCryptoState,
   exportIdentityKey,
   importIdentityKey,
+  regenerateIdentityKey,
+  getKeyFingerprint,
   loadHistoryDeviceId,
   storeHistorySnapshot,
   loadHistorySnapshot,
@@ -27,7 +29,8 @@ let notifPollTimer = null;     // setInterval handle for notification badge poll
 let pendingAttachments = [];   // Queued attachments before send: [{kind, file, thumb, objectUrl}]
 
 // ─── E2EE device state ───────────────────────────────────────────────────────
-let currentDeviceId = null;    // UUID registered on server for this device
+let currentDeviceId = null;       // UUID registered on server for this device
+let currentDeviceVerified = false; // Whether this device has been approved
 // After importing a recovery code this is set to the old device_id.
 // The old device_id is used as ?device_id= when fetching message history so the
 // server returns ciphertexts encrypted for the original device.
@@ -94,6 +97,7 @@ function renderHeader() {
       auth.clearTokens();
       currentUser = null;
       currentDeviceId = null;
+      currentDeviceVerified = false;
       chatBundles = {};
       chatBundleTimestamps = {};
       // Keys stay in IndexedDB — they'll be reloaded on next login
@@ -279,6 +283,7 @@ function handleNewDevicePending(msg) {
 
 function handleDeviceApproved(msg) {
   if (msg.device_id === currentDeviceId) {
+    currentDeviceVerified = true;
     // Remove the "waiting for approval" banner
     document.getElementById("device-pending-status")?.remove();
     showHistorySyncOffer();
@@ -577,6 +582,7 @@ function updateReadReceipts() {
  * this device on the server if not already registered.
  */
 async function initializeDevice() {
+  currentDeviceVerified = false; // Will be updated based on actual server state below
   await loadOrCreateIdentityKeys();
 
   // Check if we already have a device ID in IndexedDB
@@ -589,6 +595,7 @@ async function initializeDevice() {
       const found = deviceList.find((d) => d.id === storedDeviceId);
       if (found) {
         currentDeviceId = storedDeviceId;
+        currentDeviceVerified = found.is_verified;
         if (!found.is_verified) {
           showDevicePendingStatus();
         } else {
@@ -613,6 +620,7 @@ async function initializeDevice() {
   });
 
   currentDeviceId = result.device_id;
+  currentDeviceVerified = result.is_verified;
   await storeDeviceId(currentDeviceId);
 
   if (!result.is_verified) {
@@ -640,14 +648,58 @@ function showDevicePendingStatus() {
  * Modal for exporting / importing the E2EE recovery key.
  * Accessible from the Profile page via the "🔑 Recovery key" button.
  */
-function showRecoveryKeyModal() {
+async function showRecoveryKeyModal() {
   const existing = document.getElementById("recovery-key-modal");
   if (existing) existing.remove();
+
+  const fingerprint = await getKeyFingerprint().catch(() => "—");
 
   const overlay = document.createElement("div");
   overlay.id = "recovery-key-modal";
   overlay.style.cssText =
     "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px";
+
+  // Sections that touch the private key are only available on verified devices.
+  // On a pending device we show an explanatory note instead.
+  const verifiedSections = currentDeviceVerified ? `
+    <div>
+      <button class="btn btn-outline" style="width:100%" id="rk-export-btn">Show my recovery key</button>
+      <!-- Password gate + key textarea rendered here dynamically after password verify -->
+      <div id="rk-export-area" style="display:none;margin-top:8px"></div>
+    </div>
+
+    <hr style="border:none;border-top:1px solid var(--border);margin:4px 0">
+
+    <div>
+      <button class="btn btn-outline" style="width:100%;color:var(--danger,#e53935);border-color:var(--danger,#e53935)"
+        id="rk-regen-toggle">⚠ Generate new key</button>
+      <div id="rk-regen-area" style="display:none;margin-top:8px;padding:10px;border-radius:8px;background:rgba(229,57,53,.07);border:1px solid var(--danger,#e53935)">
+        <p style="font-size:12px;margin-bottom:10px">
+          <strong>This cannot be undone.</strong> A new key pair will be generated,
+          all your existing devices will be removed from the server, and anyone
+          who tries to send you a message will automatically get your new key
+          on their next send. Your message history will no longer be decryptable
+          with the old key.
+        </p>
+        <p style="font-size:12px;margin-bottom:10px">
+          Save your new recovery key immediately after generation.
+        </p>
+        <button class="btn" style="width:100%;background:var(--danger,#e53935);border-color:var(--danger,#e53935)"
+          id="rk-regen-btn">Generate new key</button>
+        <!-- Password gate rendered here dynamically before generation proceeds -->
+        <div id="rk-regen-pw-gate" style="display:none;margin-top:10px"></div>
+      </div>
+    </div>
+
+    <hr style="border:none;border-top:1px solid var(--border);margin:4px 0">
+  ` : `
+    <div style="padding:10px 12px;border-radius:8px;background:var(--bg-secondary,#f5f5f5);font-size:13px;color:var(--text-secondary)">
+      🔒 Exporting and regenerating the recovery key is only available on a verified device.
+      Once this device is approved, these options will appear here.
+    </div>
+
+    <hr style="border:none;border-top:1px solid var(--border);margin:4px 0">
+  `;
 
   overlay.innerHTML = `
     <div class="card" style="max-width:480px;width:100%;max-height:90vh;overflow-y:auto">
@@ -655,23 +707,18 @@ function showRecoveryKeyModal() {
         <h3 style="margin:0">🔑 Recovery key</h3>
         <button class="btn btn-sm btn-outline" id="rk-close">✕</button>
       </div>
-      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">
         Your recovery key lets you restore access to your message history on a new
         device or after re-logging in. Keep it in a safe place — anyone who has it
         can read your messages.
       </p>
+      <p style="font-size:12px;color:var(--text-muted);margin-bottom:16px">
+        Current key fingerprint:
+        <code id="rk-fingerprint" style="background:var(--bg-secondary,#f5f5f5);padding:2px 6px;border-radius:4px;font-size:12px">${escapeHtml(fingerprint)}</code>
+      </p>
 
       <div style="display:flex;flex-direction:column;gap:12px">
-        <div>
-          <button class="btn btn-outline" style="width:100%" id="rk-export-btn">Show my recovery key</button>
-          <div id="rk-export-area" style="display:none;margin-top:8px">
-            <textarea id="rk-export-code" rows="5" readonly
-              style="width:100%;font-family:monospace;font-size:11px;resize:none;box-sizing:border-box"></textarea>
-            <button class="btn btn-sm btn-outline" id="rk-copy-btn" style="margin-top:6px;width:100%">📋 Copy to clipboard</button>
-          </div>
-        </div>
-
-        <hr style="border:none;border-top:1px solid var(--border);margin:4px 0">
+        ${verifiedSections}
 
         <div>
           <button class="btn btn-outline" style="width:100%" id="rk-import-toggle">Restore from recovery key</button>
@@ -696,30 +743,101 @@ function showRecoveryKeyModal() {
   document.getElementById("rk-close").onclick = () => overlay.remove();
   overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
 
-  // Export
-  document.getElementById("rk-export-btn").onclick = async () => {
-    const area = document.getElementById("rk-export-area");
-    if (area.style.display !== "none") { area.style.display = "none"; return; }
-    try {
-      document.getElementById("rk-export-code").value = await exportIdentityKey();
-      area.style.display = "block";
-    } catch (e) {
-      toast("Failed to export key: " + (e.message || e));
+  // ── Shared password-confirm helper ──────────────────────────────────────────
+  // Inserts an inline password prompt into `container`.
+  // On confirmed password calls `onVerified()`.
+  // `confirmLabel` is the text on the confirm button.
+  function insertPasswordGate(container, confirmLabel, onVerified) {
+    container.innerHTML = `
+      <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">
+        Confirm your account password to continue:
+      </p>
+      <input type="password" id="rk-pw-input" placeholder="Your password"
+        style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;box-sizing:border-box;margin-bottom:6px">
+      <div class="error-msg" id="rk-pw-error" style="margin-bottom:6px"></div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-outline" style="flex:1" id="rk-pw-cancel">Cancel</button>
+        <button class="btn" style="flex:1" id="rk-pw-confirm">${escapeHtml(confirmLabel)}</button>
+      </div>
+    `;
+    container.style.display = "block";
+
+    const input = document.getElementById("rk-pw-input");
+    const errEl = document.getElementById("rk-pw-error");
+    const confirmBtn = document.getElementById("rk-pw-confirm");
+
+    // Focus the field so the user can type immediately
+    requestAnimationFrame(() => input.focus());
+
+    document.getElementById("rk-pw-cancel").onclick = () => {
+      container.style.display = "none";
+      container.innerHTML = "";
+    };
+
+    async function attemptVerify() {
+      const pw = input.value;
+      if (!pw) { errEl.textContent = "Please enter your password."; return; }
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = "Checking…";
+      errEl.textContent = "";
+      try {
+        await auth.verifyPassword(pw);
+        container.style.display = "none";
+        container.innerHTML = "";
+        await onVerified();
+      } catch (err) {
+        errEl.textContent =
+          (err && err.message) ? err.message : "Incorrect password.";
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = confirmLabel;
+        input.value = "";
+        input.focus();
+      }
     }
+
+    confirmBtn.onclick = attemptVerify;
+    input.onkeydown = (e) => { if (e.key === "Enter") attemptVerify(); };
+  }
+
+  // ── Export (verified devices only) ──────────────────────────────────────────
+  if (currentDeviceVerified) document.getElementById("rk-export-btn").onclick = () => {
+    const area = document.getElementById("rk-export-area");
+    // If the key is already shown, toggle it off
+    if (area.style.display !== "none" && !area.querySelector("#rk-pw-input")) {
+      area.style.display = "none";
+      return;
+    }
+    // If a password gate is already visible, do nothing
+    if (area.querySelector("#rk-pw-input")) return;
+
+    insertPasswordGate(area, "Show key", async () => {
+      try {
+        area.innerHTML = `
+          <textarea id="rk-export-code" rows="5" readonly
+            style="width:100%;font-family:monospace;font-size:11px;resize:none;box-sizing:border-box"></textarea>
+          <button class="btn btn-sm btn-outline" id="rk-copy-btn" style="margin-top:6px;width:100%">📋 Copy to clipboard</button>
+        `;
+        area.style.display = "block";
+        document.getElementById("rk-export-code").value = await exportIdentityKey();
+
+        document.getElementById("rk-copy-btn").onclick = () => {
+          const code = document.getElementById("rk-export-code").value;
+          navigator.clipboard.writeText(code)
+            .then(() => toast("Copied!"))
+            .catch(() => {
+              document.getElementById("rk-export-code").select();
+              document.execCommand("copy");
+              toast("Copied!");
+            });
+        };
+      } catch (e) {
+        toast("Failed to export key: " + (e.message || e));
+        area.style.display = "none";
+      }
+    });
   };
 
-  document.getElementById("rk-copy-btn").onclick = () => {
-    const code = document.getElementById("rk-export-code").value;
-    navigator.clipboard.writeText(code)
-      .then(() => toast("Copied!"))
-      .catch(() => {
-        document.getElementById("rk-export-code").select();
-        document.execCommand("copy");
-        toast("Copied!");
-      });
-  };
-
-  // Import
+  // ── Import ───────────────────────────────────────────────────────────────────
   document.getElementById("rk-import-toggle").onclick = () => {
     const area = document.getElementById("rk-import-area");
     area.style.display = area.style.display === "none" ? "block" : "none";
@@ -752,6 +870,79 @@ function showRecoveryKeyModal() {
       btn.disabled = false;
       btn.textContent = "Restore & re-register";
     }
+  };
+
+  // ── Regenerate (verified devices only) ──────────────────────────────────────
+  if (currentDeviceVerified) document.getElementById("rk-regen-toggle").onclick = () => {
+    const area = document.getElementById("rk-regen-area");
+    area.style.display = area.style.display === "none" ? "block" : "none";
+  };
+
+  if (currentDeviceVerified) document.getElementById("rk-regen-btn").onclick = () => {
+    const pwGate = document.getElementById("rk-regen-pw-gate");
+    // If gate is already showing, do nothing (avoid double-render)
+    if (pwGate.style.display !== "none") return;
+
+    insertPasswordGate(pwGate, "Confirm & generate", async () => {
+      const btn = document.getElementById("rk-regen-btn");
+      if (btn) { btn.disabled = true; btn.textContent = "Generating…"; }
+
+      try {
+        const oldFingerprint = await getKeyFingerprint().catch(() => "—");
+
+        // 1. Revoke every existing device so senders stop encrypting for old keys.
+        const allDevices = await devices.list();
+        await Promise.allSettled(allDevices.map((d) => devices.revoke(d.id)));
+
+        // 2. Generate new key pair, wipe local sessions/device state.
+        await regenerateIdentityKey();
+        currentDeviceId = null;
+        historyDeviceId = null;
+        chatBundles = {};
+        chatBundleTimestamps = {};
+
+        // 3. Re-register with the new key.
+        disconnectWs();
+        await initializeDevice();
+        connectWs();
+
+        // 4. Show the new recovery code immediately.
+        const newCode = await exportIdentityKey();
+        const newFingerprint = await getKeyFingerprint();
+        overlay.innerHTML = `
+          <div class="card" style="max-width:480px;width:100%">
+            <h3 style="margin-bottom:8px">🔑 New key generated</h3>
+            <div style="font-size:12px;margin-bottom:12px;display:flex;flex-direction:column;gap:4px">
+              <span>Old fingerprint: <code style="background:var(--bg-secondary,#f5f5f5);padding:2px 6px;border-radius:4px;text-decoration:line-through;color:var(--text-muted)">${escapeHtml(oldFingerprint)}</code></span>
+              <span>New fingerprint: <code style="background:var(--bg-secondary,#f5f5f5);padding:2px 6px;border-radius:4px;color:var(--success,#2e7d32)">${escapeHtml(newFingerprint)}</code></span>
+            </div>
+            <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">
+              Save this recovery code now. You won't be able to retrieve it again.
+            </p>
+            <textarea rows="5" readonly id="rk-new-code"
+              style="width:100%;font-family:monospace;font-size:11px;resize:none;box-sizing:border-box"
+            >${escapeHtml(newCode)}</textarea>
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <button class="btn btn-outline" style="flex:1" id="rk-copy-new">📋 Copy</button>
+              <button class="btn" style="flex:1" id="rk-done-new">Done</button>
+            </div>
+          </div>
+        `;
+        document.getElementById("rk-copy-new").onclick = () => {
+          navigator.clipboard.writeText(newCode)
+            .then(() => toast("Copied!"))
+            .catch(() => { document.getElementById("rk-new-code").select(); document.execCommand("copy"); toast("Copied!"); });
+        };
+        document.getElementById("rk-done-new").onclick = () => {
+          overlay.remove();
+          if (currentChatId) openChat(currentChatId);
+        };
+        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+      } catch (e) {
+        toast("Failed to regenerate key: " + (e.message || e));
+        if (btn) { btn.disabled = false; btn.textContent = "Generate new key"; }
+      }
+    });
   };
 }
 
@@ -1078,10 +1269,17 @@ async function renderProfile(container) {
       ? `<img class="avatar" src="${escapeAttr(profile.avatar_url)}" alt="" />`
       : `<div class="avatar avatar-placeholder">${(profile.username[0] || "?").toUpperCase()}</div>`;
 
+    const recoveryKeyBtn = currentDeviceVerified
+      ? `<button class="btn btn-sm btn-outline" id="recovery-key-btn"
+           title="Export or import your encryption recovery key">🔑 Recovery key</button>`
+      : `<button class="btn btn-sm btn-outline" id="recovery-key-btn"
+           title="Import a recovery key to restore message history"
+           style="opacity:.7">🔑 Restore key</button>`;
+
     const actionBtn = isMe
       ? `<div style="display:flex;gap:8px">
            <button class="btn btn-sm" id="edit-profile-btn">Edit profile</button>
-           <button class="btn btn-sm btn-outline" id="recovery-key-btn" title="Export or import your encryption recovery key">🔑 Recovery key</button>
+           ${recoveryKeyBtn}
          </div>`
       : `<button class="btn btn-sm ${profile.is_following ? "follow-btn-following" : ""}" id="follow-btn">${profile.is_following ? "Unfollow" : "Follow"}</button>`;
 
@@ -1178,16 +1376,24 @@ async function renderProfileEdit(container) {
         <h3 style="margin-bottom:4px">Encryption keys</h3>
         <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
           Your recovery code lets you restore access to your message history on a new device.
-          Keep it private — anyone with this code can impersonate you in chats.
+          Keep it private — anyone with this code can read your messages.
         </p>
 
         <div style="display:flex;flex-direction:column;gap:10px">
+          ${currentDeviceVerified ? `
           <button class="btn btn-outline" id="export-key-btn">Export recovery code</button>
+          <div id="export-pw-gate" style="display:none;padding:10px;border:1px solid var(--border);border-radius:8px"></div>
           <div id="export-area" style="display:none">
             <textarea id="export-code" rows="4" readonly
               style="width:100%;font-family:monospace;font-size:12px;resize:none;box-sizing:border-box"></textarea>
             <button class="btn btn-sm btn-outline" id="copy-key-btn" style="margin-top:6px">Copy to clipboard</button>
           </div>
+          ` : `
+          <div style="padding:10px 12px;border-radius:8px;background:var(--bg-secondary,#f5f5f5);font-size:13px;color:var(--text-secondary)">
+            🔒 Exporting the recovery code is only available on a verified device.
+            Once this device is approved, the export option will appear here.
+          </div>
+          `}
 
           <button class="btn btn-outline" id="show-import-btn">Import recovery code</button>
           <div id="import-area" style="display:none">
@@ -1207,26 +1413,73 @@ async function renderProfileEdit(container) {
 
   document.getElementById("cancel-edit").onclick = () => navigate("profile");
 
-  // ── Security card ──
-  document.getElementById("export-key-btn").onclick = async () => {
-    const area = document.getElementById("export-area");
-    if (area.style.display !== "none") { area.style.display = "none"; return; }
-    try {
-      document.getElementById("export-code").value = await exportIdentityKey();
-      area.style.display = "block";
-    } catch (e) {
-      toast("Failed to export key: " + (e.message || e));
-    }
-  };
+  // ── Security card — export (verified devices only) ──
+  if (currentDeviceVerified) {
+    document.getElementById("export-key-btn").onclick = () => {
+      const area = document.getElementById("export-area");
+      // Toggle off if key is already shown
+      if (area.style.display !== "none") { area.style.display = "none"; return; }
 
-  document.getElementById("copy-key-btn").onclick = () => {
-    const code = document.getElementById("export-code").value;
-    navigator.clipboard.writeText(code).then(() => toast("Copied!")).catch(() => {
-      document.getElementById("export-code").select();
-      document.execCommand("copy");
-      toast("Copied!");
-    });
-  };
+      const gate = document.getElementById("export-pw-gate");
+      // If password gate already open — ignore
+      if (gate.style.display !== "none") return;
+
+      gate.innerHTML = `
+        <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">
+          Confirm your account password to export:
+        </p>
+        <input type="password" id="pe-pw-input" placeholder="Your password"
+          style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;box-sizing:border-box;margin-bottom:6px">
+        <div class="error-msg" id="pe-pw-error" style="margin-bottom:6px"></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline" style="flex:1" id="pe-pw-cancel">Cancel</button>
+          <button class="btn" style="flex:1" id="pe-pw-confirm">Show code</button>
+        </div>
+      `;
+      gate.style.display = "block";
+
+      const input = document.getElementById("pe-pw-input");
+      const errEl = document.getElementById("pe-pw-error");
+      const confirmBtn = document.getElementById("pe-pw-confirm");
+      requestAnimationFrame(() => input.focus());
+
+      const close = () => { gate.style.display = "none"; gate.innerHTML = ""; };
+
+      document.getElementById("pe-pw-cancel").onclick = close;
+
+      async function attempt() {
+        const pw = input.value;
+        if (!pw) { errEl.textContent = "Please enter your password."; return; }
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Checking…";
+        errEl.textContent = "";
+        try {
+          await auth.verifyPassword(pw);
+          close();
+          document.getElementById("export-code").value = await exportIdentityKey();
+          document.getElementById("export-area").style.display = "block";
+        } catch (err) {
+          errEl.textContent = (err && err.message) ? err.message : "Incorrect password.";
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = "Show code";
+          input.value = "";
+          input.focus();
+        }
+      }
+
+      confirmBtn.onclick = attempt;
+      input.onkeydown = (e) => { if (e.key === "Enter") attempt(); };
+    };
+
+    document.getElementById("copy-key-btn").onclick = () => {
+      const code = document.getElementById("export-code").value;
+      navigator.clipboard.writeText(code).then(() => toast("Copied!")).catch(() => {
+        document.getElementById("export-code").select();
+        document.execCommand("copy");
+        toast("Copied!");
+      });
+    };
+  }
 
   document.getElementById("show-import-btn").onclick = () => {
     const area = document.getElementById("import-area");

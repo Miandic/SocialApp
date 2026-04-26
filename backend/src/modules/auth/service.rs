@@ -106,6 +106,17 @@ impl AuthService {
     pub async fn logout(pool: &PgPool, user_id: Uuid) -> AppResult<()> {
         AuthRepo::delete_user_refresh_tokens(pool, user_id).await
     }
+
+    /// Check whether the given plaintext password matches the stored hash for
+    /// the specified user.  Returns `Ok(())` on match; `Err(Unauthorized)` on mismatch.
+    /// Used to gate sensitive operations (e.g. recovery-key export) without
+    /// issuing new tokens.
+    pub async fn check_password(pool: &PgPool, user_id: Uuid, password: &str) -> AppResult<()> {
+        let user = AuthRepo::find_by_id(pool, user_id)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized("User not found".into()))?;
+        verify_password(password, &user.password_hash)
+    }
 }
 
 // ─── Helpers ───

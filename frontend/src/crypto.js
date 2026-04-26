@@ -412,6 +412,49 @@ export async function importIdentityKey(base64) {
   _sessionCache.clear();
 }
 
+/**
+ * Generate a brand-new identity key pair, replacing the old one.
+ * Wipes all derived state (sessions, device_id, history_device_id, history snapshot)
+ * so the caller can re-register with the new key.
+ *
+ * After calling this the app MUST revoke all existing server-side devices and
+ * call initializeDevice() to register the new key, otherwise old devices will
+ * still appear in bundle fetches and senders may encrypt for them.
+ */
+export async function regenerateIdentityKey() {
+  _identityKeyPair = await generateX25519KeyPair();
+  await dbSet("identity", await keyPairToJwk(_identityKeyPair));
+
+  // Wipe every other entry — sessions, device ids, history snapshot, pre-keys.
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    const store = tx.objectStore(STORE);
+    const req = store.openCursor();
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (!cursor) return;
+      if (cursor.key !== "identity") cursor.delete();
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  _sessionCache.clear();
+}
+
+/**
+ * Return a short human-readable fingerprint of the current identity public key.
+ * Uses the first 16 characters of the base64url-encoded raw public key (X25519 "x" field).
+ * Distinct keys will produce visibly different fingerprints.
+ */
+export async function getKeyFingerprint() {
+  if (!_identityKeyPair) await loadOrCreateIdentityKeys();
+  const jwk = await crypto.subtle.exportKey("jwk", _identityKeyPair.publicKey);
+  return jwk.x.slice(0, 16);
+}
+
 /** Load the stored history device_id (set after importing a recovery code). */
 export async function loadHistoryDeviceId() {
   return dbGet("history_device_id");

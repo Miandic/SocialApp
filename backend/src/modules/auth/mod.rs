@@ -13,4 +13,5 @@ pub fn router() -> Router<AppState> {
         .route("/refresh", post(handlers::refresh))
         .route("/logout", post(handlers::logout))
         .route("/me", get(handlers::me))
+        .route("/verify-password", post(handlers::verify_password))
 }

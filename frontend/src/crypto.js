@@ -351,6 +351,87 @@ export async function preloadSession(deviceId, identityKeyBase64) {
   await getOrDeriveSessionKey(deviceId, identityKeyBase64);
 }
 
+// ─── Recovery code export / import ───────────────────────────────────────────
+
+/**
+ * Export the current identity key pair + device_id as a base64-encoded JSON blob.
+ *
+ * Why include device_id:
+ *   Message ciphertexts are stored in `message_device_ciphertexts` keyed by
+ *   device_id. When a new device imports this code and re-registers, it gets a
+ *   different device_id. By keeping the old device_id we can still pass it to the
+ *   REST API (`?device_id=<old>`) and retrieve the correct ciphertexts.
+ *
+ * ECDH commutativity guarantees that any session derived as ECDH(priv, B.pub)
+ * on the old device produces the same key on the new device (same priv), so
+ * decryption will succeed once sessions are re-derived from bundle fetches.
+ */
+export async function exportIdentityKey() {
+  if (!_identityKeyPair) await loadOrCreateIdentityKeys();
+  const jwks = await keyPairToJwk(_identityKeyPair);
+  const deviceId = await dbGet("device_id");
+  return btoa(JSON.stringify({ ...jwks, deviceId: deviceId || null }));
+}
+
+/**
+ * Import a previously exported identity key, replacing the current one.
+ * The `deviceId` embedded in the code is stored as `history_device_id` so the
+ * app can fetch old message ciphertexts from the server.
+ */
+export async function importIdentityKey(base64) {
+  const parsed = JSON.parse(atob(base64));
+  // Destructure deviceId from the payload; the rest is the JWK key pair.
+  const { deviceId, ...jwks } = parsed;
+  const keyPair = await jwkToKeyPair(jwks);
+
+  // Persist and activate new identity
+  await dbSet("identity", jwks);
+  _identityKeyPair = keyPair;
+
+  // Preserve the old device_id under a separate key so history fetches work.
+  if (deviceId) await dbSet("history_device_id", deviceId);
+
+  // Clear ALL other derived state (sessions, current device_id, history snapshot).
+  // initializeDevice will re-register with the restored identity key.
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    const store = tx.objectStore(STORE);
+    const req = store.openCursor();
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (!cursor) return;
+      const keep = new Set(["identity", "history_device_id"]);
+      if (!keep.has(cursor.key)) cursor.delete();
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  _sessionCache.clear();
+}
+
+/** Load the stored history device_id (set after importing a recovery code). */
+export async function loadHistoryDeviceId() {
+  return dbGet("history_device_id");
+}
+
+/**
+ * Store a decrypted history snapshot from a device-to-device sync.
+ *
+ * Format: `{ version: 1, chats: { [chatId]: [ {id, sender_id, sender_username,
+ *   content, message_type, created_at} ] } }`
+ */
+export async function storeHistorySnapshot(snapshot) {
+  await dbSet("history_snapshot", snapshot);
+}
+
+/** Load the history snapshot written by showHistoryDownloadBanner. */
+export async function loadHistorySnapshot() {
+  return dbGet("history_snapshot");
+}
+
 // ─── Device identity storage helpers ─────────────────────────────────────────
 
 export async function storeDeviceId(deviceId) {

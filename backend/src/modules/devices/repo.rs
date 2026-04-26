@@ -36,6 +36,24 @@ impl DevicesRepo {
         Ok(device)
     }
 
+    /// Returns true if the user already has a *verified* device with this exact
+    /// identity_key public key.  Used to auto-verify recovery-code re-registrations.
+    pub async fn has_verified_device_with_key(
+        pool: &PgPool,
+        user_id: Uuid,
+        identity_key: &str,
+    ) -> AppResult<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user_devices \
+             WHERE user_id = $1 AND identity_key = $2 AND is_verified = TRUE)",
+        )
+        .bind(user_id)
+        .bind(identity_key)
+        .fetch_one(pool)
+        .await?;
+        Ok(exists)
+    }
+
     pub async fn user_has_verified_devices(pool: &PgPool, user_id: Uuid) -> AppResult<bool> {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM user_devices WHERE user_id = $1 AND is_verified = TRUE)",

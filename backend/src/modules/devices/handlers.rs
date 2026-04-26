@@ -30,11 +30,15 @@ pub async fn register_device(
     let has_devices = DevicesRepo::user_has_verified_devices(&state.db, auth.user_id).await?;
     // Auto-verify if:
     //  (a) the user has no verified devices at all — first device on the account, OR
-    //  (b) the user has verified devices in the DB but NONE of them are currently
-    //      online — they re-logged in from a new browser/incognito tab and there
-    //      is no one around to approve the new device, so we treat it as trusted.
+    //  (b) no verified device is currently online (nobody around to approve), OR
+    //  (c) the submitted identity_key already exists on a verified device — this is
+    //      a recovery-code restore: possession of the private key proves identity,
+    //      so we trust it regardless of online state or race conditions with WS teardown.
     let is_online = state.hub.is_online(auth.user_id).await;
-    let is_verified = !has_devices || !is_online;
+    let same_key_verified = DevicesRepo::has_verified_device_with_key(
+        &state.db, auth.user_id, &req.identity_key,
+    ).await?;
+    let is_verified = !has_devices || !is_online || same_key_verified;
 
     let device = DevicesRepo::create_device(
         &state.db,

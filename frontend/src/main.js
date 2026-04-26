@@ -10,6 +10,11 @@ import {
   loadDeviceId,
   getDeviceName,
   clearCryptoState,
+  exportIdentityKey,
+  importIdentityKey,
+  loadHistoryDeviceId,
+  storeHistorySnapshot,
+  loadHistorySnapshot,
 } from "./crypto.js";
 
 // ─── Global state ───────────────────────────────────────────────────────────
@@ -23,6 +28,10 @@ let pendingAttachments = [];   // Queued attachments before send: [{kind, file, 
 
 // ─── E2EE device state ───────────────────────────────────────────────────────
 let currentDeviceId = null;    // UUID registered on server for this device
+// After importing a recovery code this is set to the old device_id.
+// The old device_id is used as ?device_id= when fetching message history so the
+// server returns ciphertexts encrypted for the original device.
+let historyDeviceId = null;
 // chatId → flat array of {device_id, identity_key, ...} for all participants
 let chatBundles = {};
 // chatId → timestamp (Date.now()) when bundles were last fetched
@@ -228,6 +237,7 @@ function handleNewDevicePending(msg) {
     <span>New device "<strong>${escapeHtml(msg.device_name)}</strong>" is waiting for approval.</span>
     <div class="device-pending-actions">
       <button class="btn btn-sm" id="approve-device-btn">Approve</button>
+      <button class="btn btn-sm" id="approve-send-history-btn">Approve &amp; send history</button>
       <button class="btn btn-sm btn-outline" id="deny-device-btn">Deny</button>
     </div>
   `;
@@ -237,11 +247,28 @@ function handleNewDevicePending(msg) {
     try {
       await devices.approve(msg.device_id);
       banner.remove();
-      toast("Device approved. You can now start a history sync from Settings.");
+      toast("Device approved.");
     } catch (e) {
       toast(e.message || "Failed to approve device");
     }
   };
+
+  document.getElementById("approve-send-history-btn").onclick = async () => {
+    const btn = document.getElementById("approve-send-history-btn");
+    btn.disabled = true;
+    btn.textContent = "Sending…";
+    try {
+      await devices.approve(msg.device_id);
+      await sendHistoryToDevice(msg.device_id);
+      banner.remove();
+      toast("Device approved and history sent.");
+    } catch (e) {
+      toast(e.message || "Failed to send history");
+      btn.disabled = false;
+      btn.textContent = "Approve & send history";
+    }
+  };
+
   document.getElementById("deny-device-btn").onclick = async () => {
     try {
       await devices.revoke(msg.device_id);
@@ -252,13 +279,124 @@ function handleNewDevicePending(msg) {
 
 function handleDeviceApproved(msg) {
   if (msg.device_id === currentDeviceId) {
-    // This device was approved — show history sync offer
+    // Remove the "waiting for approval" banner
+    document.getElementById("device-pending-status")?.remove();
     showHistorySyncOffer();
   }
 }
 
 function handleHistorySyncReady(msg) {
   showHistoryDownloadBanner(msg.sender_device_id);
+}
+
+/**
+ * Collect all message history accessible to the current device, encrypt it
+ * for `recipientDeviceId`, and POST to the history-sync endpoint.
+ *
+ * Called by A1 after approving A2.
+ */
+async function sendHistoryToDevice(recipientDeviceId) {
+  // Fetch A2's identity key so we can encrypt specifically for it.
+  const myBundles = await devices.getUserBundles(currentUser.id);
+  const recipientBundle = myBundles.find((b) => b.device_id === recipientDeviceId);
+  if (!recipientBundle) throw new Error("Recipient device bundle not found (is it verified?)");
+
+  // Collect all chats with their decrypted messages.
+  const allChats = await messenger.listChats(currentDeviceId);
+  const snapshot = { version: 1, chats: {} };
+
+  for (const chat of allChats) {
+    try {
+      const msgs = await messenger.getMessages(chat.id, currentDeviceId);
+      const decrypted = await decryptMessageList(msgs);
+      snapshot.chats[chat.id] = decrypted
+        .filter((m) => m.encrypted_content !== "🔒 [encrypted]" && m.encrypted_content !== "e2ee")
+        .map((m) => ({
+          id: m.id,
+          sender_id: m.sender_id,
+          sender_device_id: m.sender_device_id,
+          sender_username: m.sender_username,
+          content: m.encrypted_content, // plaintext at this point
+          message_type: m.message_type,
+          created_at: m.created_at,
+        }));
+    } catch (e) {
+      console.warn(`[History] Skipping chat ${chat.id}:`, e);
+    }
+  }
+
+  const json = JSON.stringify(snapshot);
+
+  // Encrypt the package for the recipient device.
+  const [enc] = await encryptForDevices(json, [recipientBundle]);
+
+  await devices.sendHistoryPackage({
+    sender_device_id: currentDeviceId,
+    recipient_device_id: recipientDeviceId,
+    ciphertext: enc.encrypted_content,
+    nonce: enc.nonce,
+  });
+}
+
+/**
+ * Download, decrypt, and store a history sync package sent by another device.
+ * Triggered when A2 receives a `HistorySyncReady` WS event.
+ */
+async function showHistoryDownloadBanner(senderDeviceId) {
+  const banner = document.createElement("div");
+  banner.className = "device-pending-banner";
+  banner.innerHTML = `<span>📦 Message history is available — <button class="btn btn-sm" id="download-history-btn">Download now</button></span>`;
+  document.body.appendChild(banner);
+
+  document.getElementById("download-history-btn").onclick = async () => {
+    const btn = document.getElementById("download-history-btn");
+    btn.disabled = true;
+    btn.textContent = "Downloading…";
+
+    try {
+      const pkg = await devices.getHistoryPackage(currentDeviceId);
+      if (!pkg) {
+        banner.innerHTML = `<span>⚠️ History package not found. It may have expired.</span>
+          <button class="btn btn-sm btn-outline" id="close-hist-banner">Close</button>`;
+        document.getElementById("close-hist-banner").onclick = () => banner.remove();
+        return;
+      }
+
+      // Derive/look up the sender's identity key so we can decrypt.
+      let senderIdentityKey = null;
+      try {
+        const myBundles = await devices.getUserBundles(currentUser.id);
+        const senderBundle = myBundles.find((b) => b.device_id === pkg.sender_device_id);
+        if (senderBundle) senderIdentityKey = senderBundle.identity_key;
+      } catch {}
+
+      const json = await decryptMessage(
+        pkg.ciphertext,
+        pkg.nonce,
+        pkg.sender_device_id,
+        senderIdentityKey
+      );
+
+      const snapshot = JSON.parse(json);
+      await storeHistorySnapshot(snapshot);
+
+      // Remove from server — it has been consumed.
+      await devices.deleteHistoryPackage(currentDeviceId);
+
+      banner.innerHTML = `<span>✅ History restored!</span>
+        <button class="btn btn-sm" id="close-hist-ok">Close</button>`;
+      document.getElementById("close-hist-ok").onclick = () => {
+        banner.remove();
+        // If a chat is open, reload it to show the restored messages.
+        if (currentChatId) openChat(currentChatId);
+      };
+    } catch (e) {
+      console.error("[History] Download failed:", e);
+      banner.innerHTML = `<span>❌ Failed to decrypt history: ${escapeHtml(e.message || "unknown error")}</span>
+        <button class="btn btn-sm btn-outline" id="close-hist-err">Close</button>`;
+      document.getElementById("close-hist-err").onclick = () => banner.remove();
+    }
+  };
 }
 
 async function handleNewMessage(msg) {
@@ -303,6 +441,20 @@ async function handleNewMessage(msg) {
         console.warn("[E2EE] Retry decryption failed:", e2);
         msg.encrypted_content = "🔒 [encrypted]";
       }
+    }
+  }
+
+  // If the sender's device is not in our bundle cache for this chat, the chat
+  // has a new device (e.g. partner re-logged in). Invalidate so the next send
+  // re-fetches fresh bundles — no page refresh required.
+  if (chatBundles[msg.chat_id]) {
+    const knownInBundle = chatBundles[msg.chat_id].some(
+      (b) => b.device_id === msg.sender_device_id
+    );
+    if (!knownInBundle) {
+      console.log(`[E2EE] New device ${msg.sender_device_id} in chat — clearing stale bundle cache`);
+      delete chatBundles[msg.chat_id];
+      delete chatBundleTimestamps[msg.chat_id];
     }
   }
 
@@ -439,6 +591,8 @@ async function initializeDevice() {
         currentDeviceId = storedDeviceId;
         if (!found.is_verified) {
           showDevicePendingStatus();
+        } else {
+          document.getElementById("device-pending-status")?.remove();
         }
         return;
       }
@@ -463,6 +617,8 @@ async function initializeDevice() {
 
   if (!result.is_verified) {
     showDevicePendingStatus();
+  } else {
+    document.getElementById("device-pending-status")?.remove();
   }
 }
 
@@ -480,6 +636,125 @@ function showDevicePendingStatus() {
   document.body.appendChild(banner);
 }
 
+/**
+ * Modal for exporting / importing the E2EE recovery key.
+ * Accessible from the Profile page via the "🔑 Recovery key" button.
+ */
+function showRecoveryKeyModal() {
+  const existing = document.getElementById("recovery-key-modal");
+  if (existing) existing.remove();
+
+  const overlay = document.createElement("div");
+  overlay.id = "recovery-key-modal";
+  overlay.style.cssText =
+    "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px";
+
+  overlay.innerHTML = `
+    <div class="card" style="max-width:480px;width:100%;max-height:90vh;overflow-y:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 style="margin:0">🔑 Recovery key</h3>
+        <button class="btn btn-sm btn-outline" id="rk-close">✕</button>
+      </div>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+        Your recovery key lets you restore access to your message history on a new
+        device or after re-logging in. Keep it in a safe place — anyone who has it
+        can read your messages.
+      </p>
+
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <div>
+          <button class="btn btn-outline" style="width:100%" id="rk-export-btn">Show my recovery key</button>
+          <div id="rk-export-area" style="display:none;margin-top:8px">
+            <textarea id="rk-export-code" rows="5" readonly
+              style="width:100%;font-family:monospace;font-size:11px;resize:none;box-sizing:border-box"></textarea>
+            <button class="btn btn-sm btn-outline" id="rk-copy-btn" style="margin-top:6px;width:100%">📋 Copy to clipboard</button>
+          </div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--border);margin:4px 0">
+
+        <div>
+          <button class="btn btn-outline" style="width:100%" id="rk-import-toggle">Restore from recovery key</button>
+          <div id="rk-import-area" style="display:none;margin-top:8px">
+            <p style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">
+              Paste a previously saved recovery key. Your current keys will be replaced
+              and the device will re-register automatically.
+            </p>
+            <textarea id="rk-import-code" rows="5" placeholder="Paste recovery key here…"
+              style="width:100%;font-family:monospace;font-size:11px;resize:none;box-sizing:border-box"></textarea>
+            <div class="error-msg" id="rk-import-error" style="margin-top:4px"></div>
+            <button class="btn" style="width:100%;margin-top:8px" id="rk-import-btn">Restore &amp; re-register</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  // Close
+  document.getElementById("rk-close").onclick = () => overlay.remove();
+  overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+
+  // Export
+  document.getElementById("rk-export-btn").onclick = async () => {
+    const area = document.getElementById("rk-export-area");
+    if (area.style.display !== "none") { area.style.display = "none"; return; }
+    try {
+      document.getElementById("rk-export-code").value = await exportIdentityKey();
+      area.style.display = "block";
+    } catch (e) {
+      toast("Failed to export key: " + (e.message || e));
+    }
+  };
+
+  document.getElementById("rk-copy-btn").onclick = () => {
+    const code = document.getElementById("rk-export-code").value;
+    navigator.clipboard.writeText(code)
+      .then(() => toast("Copied!"))
+      .catch(() => {
+        document.getElementById("rk-export-code").select();
+        document.execCommand("copy");
+        toast("Copied!");
+      });
+  };
+
+  // Import
+  document.getElementById("rk-import-toggle").onclick = () => {
+    const area = document.getElementById("rk-import-area");
+    area.style.display = area.style.display === "none" ? "block" : "none";
+  };
+
+  document.getElementById("rk-import-btn").onclick = async () => {
+    const code = document.getElementById("rk-import-code").value.trim();
+    const errEl = document.getElementById("rk-import-error");
+    errEl.textContent = "";
+    if (!code) { errEl.textContent = "Paste your recovery key first."; return; }
+
+    const btn = document.getElementById("rk-import-btn");
+    btn.disabled = true;
+    btn.textContent = "Restoring…";
+
+    try {
+      await importIdentityKey(code);
+      currentDeviceId = null;
+      chatBundles = {};
+      chatBundleTimestamps = {};
+      disconnectWs();
+      await initializeDevice();
+      historyDeviceId = await loadHistoryDeviceId().catch(() => null);
+      connectWs();
+      overlay.remove();
+      toast("Keys restored. Your message history should now be visible.");
+      if (currentChatId) openChat(currentChatId);
+    } catch (e) {
+      errEl.textContent = "Invalid recovery key: " + (e.message || "parse error");
+      btn.disabled = false;
+      btn.textContent = "Restore & re-register";
+    }
+  };
+}
+
 function showHistorySyncOffer() {
   const existing = document.getElementById("device-pending-status");
   if (existing) existing.remove();
@@ -488,35 +763,11 @@ function showHistorySyncOffer() {
   banner.id = "history-sync-offer";
   banner.className = "device-pending-banner";
   banner.innerHTML = `
-    <span>✅ Device approved! Your other device can now send you your message history.</span>
+    <span>✅ Device approved! If the other device clicks "Approve & send history" you will receive your message history here.</span>
     <button class="btn btn-sm" id="dismiss-sync-banner">Got it</button>
   `;
   document.body.appendChild(banner);
   document.getElementById("dismiss-sync-banner").onclick = () => banner.remove();
-}
-
-function showHistoryDownloadBanner(senderDeviceId) {
-  const banner = document.createElement("div");
-  banner.className = "device-pending-banner";
-  banner.innerHTML = `
-    <span>📦 History sync available — downloading your message history...</span>
-  `;
-  document.body.appendChild(banner);
-
-  // Fetch and consume the history package
-  devices.getHistoryPackage(currentDeviceId)
-    .then(async (pkg) => {
-      if (!pkg) { banner.remove(); return; }
-      // History restore will be a Phase 2 feature;
-      // for now acknowledge receipt and delete the package
-      await devices.deleteHistoryPackage(currentDeviceId);
-      banner.innerHTML = `
-        <span>✅ History sync complete.</span>
-        <button class="btn btn-sm" id="close-sync-ok">Close</button>
-      `;
-      document.getElementById("close-sync-ok").onclick = () => banner.remove();
-    })
-    .catch(() => banner.remove());
 }
 
 // ─── Unread badge sync ───────────────────────────────────────────────────────
@@ -828,7 +1079,10 @@ async function renderProfile(container) {
       : `<div class="avatar avatar-placeholder">${(profile.username[0] || "?").toUpperCase()}</div>`;
 
     const actionBtn = isMe
-      ? `<button class="btn btn-sm" id="edit-profile-btn">Edit profile</button>`
+      ? `<div style="display:flex;gap:8px">
+           <button class="btn btn-sm" id="edit-profile-btn">Edit profile</button>
+           <button class="btn btn-sm btn-outline" id="recovery-key-btn" title="Export or import your encryption recovery key">🔑 Recovery key</button>
+         </div>`
       : `<button class="btn btn-sm ${profile.is_following ? "follow-btn-following" : ""}" id="follow-btn">${profile.is_following ? "Unfollow" : "Follow"}</button>`;
 
     container.innerHTML = `
@@ -856,6 +1110,7 @@ async function renderProfile(container) {
 
     if (isMe) {
       document.getElementById("edit-profile-btn").onclick = () => navigate("profileEdit");
+      document.getElementById("recovery-key-btn").onclick = () => showRecoveryKeyModal();
     } else {
       document.getElementById("follow-btn").onclick = async () => {
         try {
@@ -885,41 +1140,131 @@ async function renderProfileEdit(container) {
   let avatarUrl = profile.avatar_url || "";
 
   container.innerHTML = `
-    <div class="card" style="max-width:500px">
-      <h2 style="margin-bottom:16px">Edit profile</h2>
-      <form id="edit-form">
-        <div class="form-group">
-          <label>Avatar</label>
-          <div style="display:flex;gap:12px;align-items:center">
-            <div id="avatar-preview">
-              ${avatarUrl
-                ? `<img class="avatar" src="${escapeAttr(avatarUrl)}" alt="" />`
-                : `<div class="avatar avatar-placeholder">${(profile.username[0] || "?").toUpperCase()}</div>`}
+    <div style="max-width:500px;display:flex;flex-direction:column;gap:16px">
+      <div class="card">
+        <h2 style="margin-bottom:16px">Edit profile</h2>
+        <form id="edit-form">
+          <div class="form-group">
+            <label>Avatar</label>
+            <div style="display:flex;gap:12px;align-items:center">
+              <div id="avatar-preview">
+                ${avatarUrl
+                  ? `<img class="avatar" src="${escapeAttr(avatarUrl)}" alt="" />`
+                  : `<div class="avatar avatar-placeholder">${(profile.username[0] || "?").toUpperCase()}</div>`}
+              </div>
+              <label class="btn btn-outline btn-sm" style="cursor:pointer;margin:0">
+                Upload
+                <input type="file" id="avatar-input" accept="image/*" style="display:none" />
+              </label>
             </div>
-            <label class="btn btn-outline btn-sm" style="cursor:pointer;margin:0">
-              Upload
-              <input type="file" id="avatar-input" accept="image/*" style="display:none" />
-            </label>
+          </div>
+          <div class="form-group">
+            <label>Display name</label>
+            <input name="display_name" maxlength="100" value="${escapeAttr(profile.display_name || "")}" />
+          </div>
+          <div class="form-group">
+            <label>Bio</label>
+            <textarea name="bio" rows="4" maxlength="500">${escapeHtml(profile.bio || "")}</textarea>
+          </div>
+          <div class="error-msg" id="edit-error"></div>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn" type="submit">Save</button>
+            <button class="btn btn-outline" type="button" id="cancel-edit">Cancel</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="card" id="security-card">
+        <h3 style="margin-bottom:4px">Encryption keys</h3>
+        <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+          Your recovery code lets you restore access to your message history on a new device.
+          Keep it private — anyone with this code can impersonate you in chats.
+        </p>
+
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <button class="btn btn-outline" id="export-key-btn">Export recovery code</button>
+          <div id="export-area" style="display:none">
+            <textarea id="export-code" rows="4" readonly
+              style="width:100%;font-family:monospace;font-size:12px;resize:none;box-sizing:border-box"></textarea>
+            <button class="btn btn-sm btn-outline" id="copy-key-btn" style="margin-top:6px">Copy to clipboard</button>
+          </div>
+
+          <button class="btn btn-outline" id="show-import-btn">Import recovery code</button>
+          <div id="import-area" style="display:none">
+            <p style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">
+              Paste your recovery code below. Your current keys will be replaced and the
+              device will re-register automatically.
+            </p>
+            <textarea id="import-code" rows="4" placeholder="Paste recovery code here…"
+              style="width:100%;font-family:monospace;font-size:12px;resize:none;box-sizing:border-box"></textarea>
+            <div class="error-msg" id="import-error" style="margin-top:4px"></div>
+            <button class="btn" id="import-key-btn" style="margin-top:8px">Restore keys &amp; re-register</button>
           </div>
         </div>
-        <div class="form-group">
-          <label>Display name</label>
-          <input name="display_name" maxlength="100" value="${escapeAttr(profile.display_name || "")}" />
-        </div>
-        <div class="form-group">
-          <label>Bio</label>
-          <textarea name="bio" rows="4" maxlength="500">${escapeHtml(profile.bio || "")}</textarea>
-        </div>
-        <div class="error-msg" id="edit-error"></div>
-        <div style="display:flex;gap:8px;margin-top:12px">
-          <button class="btn" type="submit">Save</button>
-          <button class="btn btn-outline" type="button" id="cancel-edit">Cancel</button>
-        </div>
-      </form>
+      </div>
     </div>
   `;
 
   document.getElementById("cancel-edit").onclick = () => navigate("profile");
+
+  // ── Security card ──
+  document.getElementById("export-key-btn").onclick = async () => {
+    const area = document.getElementById("export-area");
+    if (area.style.display !== "none") { area.style.display = "none"; return; }
+    try {
+      document.getElementById("export-code").value = await exportIdentityKey();
+      area.style.display = "block";
+    } catch (e) {
+      toast("Failed to export key: " + (e.message || e));
+    }
+  };
+
+  document.getElementById("copy-key-btn").onclick = () => {
+    const code = document.getElementById("export-code").value;
+    navigator.clipboard.writeText(code).then(() => toast("Copied!")).catch(() => {
+      document.getElementById("export-code").select();
+      document.execCommand("copy");
+      toast("Copied!");
+    });
+  };
+
+  document.getElementById("show-import-btn").onclick = () => {
+    const area = document.getElementById("import-area");
+    area.style.display = area.style.display === "none" ? "block" : "none";
+  };
+
+  document.getElementById("import-key-btn").onclick = async () => {
+    const code = document.getElementById("import-code").value.trim();
+    const errEl = document.getElementById("import-error");
+    errEl.textContent = "";
+    if (!code) { errEl.textContent = "Paste your recovery code first."; return; }
+
+    const btn = document.getElementById("import-key-btn");
+    btn.disabled = true;
+    btn.textContent = "Restoring…";
+
+    try {
+      // 1. Replace identity keys in IndexedDB
+      await importIdentityKey(code);
+
+      // 2. Clear old device registration so initializeDevice re-registers
+      currentDeviceId = null;
+      chatBundles = {};
+      chatBundleTimestamps = {};
+
+      // 3. Re-register with the restored key pair
+      disconnectWs();
+      await initializeDevice();
+      connectWs();
+
+      toast("Keys restored. Your sessions will be re-derived as messages arrive.");
+      navigate("profile");
+    } catch (e) {
+      errEl.textContent = "Invalid recovery code: " + (e.message || "parse error");
+      btn.disabled = false;
+      btn.textContent = "Restore keys & re-register";
+    }
+  };
 
   document.getElementById("avatar-input").onchange = async (e) => {
     const file = e.target.files[0];
@@ -1127,6 +1472,47 @@ async function renderChats(container) {
 // ─── E2EE chat helpers ────────────────────────────────────────────────────────
 
 /**
+ * Load messages for a chat, merging two sources when a history device is set:
+ *
+ *  - historyDeviceId  → old ciphertexts from before the recovery-code import
+ *  - currentDeviceId  → new ciphertexts for messages sent after re-registration
+ *
+ * The merge deduplicates by message ID and prefers the version with real
+ * ciphertext over the "e2ee" placeholder.  Result is sorted newest-first
+ * (matching the REST API order) for compatibility with the rest of the render
+ * pipeline.
+ *
+ * When no history device is set the function is a thin passthrough.
+ */
+async function loadChatMessages(chatId, params = "") {
+  if (!historyDeviceId || historyDeviceId === currentDeviceId) {
+    return messenger.getMessages(chatId, currentDeviceId, params);
+  }
+
+  const [histMsgs, currMsgs] = await Promise.all([
+    messenger.getMessages(chatId, historyDeviceId, params),
+    messenger.getMessages(chatId, currentDeviceId, params),
+  ]);
+
+  const map = new Map();
+  // History batch first — these cover the bulk of old messages
+  for (const m of histMsgs) map.set(m.id, m);
+  // Current batch second — overrides with up-to-date ciphertext where available
+  for (const m of currMsgs) {
+    const existing = map.get(m.id);
+    // Prefer the version that actually has a ciphertext (not the "e2ee" sentinel)
+    if (!existing || (m.encrypted_content !== "e2ee" && m.nonce !== "e2ee")) {
+      map.set(m.id, m);
+    }
+  }
+
+  // Preserve newest-first ordering expected by the callers
+  return Array.from(map.values()).sort(
+    (a, b) => new Date(b.created_at) - new Date(a.created_at)
+  );
+}
+
+/**
  * Fetch and cache key bundles for all members of a chat (including self).
  * Pre-derives session keys so the first send is instant.
  */
@@ -1167,7 +1553,9 @@ async function decryptMessageList(messages) {
   const result = [];
   for (const msg of messages) {
     const clone = { ...msg };
-    if (clone.encrypted_content && clone.encrypted_content !== "e2ee" && clone.nonce) {
+    if (clone._decrypted) {
+      // Already-plaintext message from a history snapshot — leave as-is.
+    } else if (clone.encrypted_content && clone.encrypted_content !== "e2ee" && clone.nonce) {
       try {
         clone.encrypted_content = await decryptMessage(
           clone.encrypted_content,
@@ -1230,8 +1618,9 @@ async function loadChatList() {
   if (!listEl) return;
 
   try {
-    // Pass device_id so the server returns per-device ciphertexts for last_message.
-    const chats = await messenger.listChats(currentDeviceId);
+    // Pass the best device_id for ciphertext lookup: history device (recovery code
+    // path) covers old messages; fall back to current device for fresh sessions.
+    const chats = await messenger.listChats(historyDeviceId || currentDeviceId);
 
     if (chats.length === 0) {
       listEl.innerHTML = `
@@ -1359,10 +1748,37 @@ async function openChat(chatId) {
     }
 
     // Cache members and fetch key bundles for all chat members.
+    // Pre-derives sessions so decryptMessageList can decrypt history without REST calls.
     chatMembers[chatId] = chat.members;
     await loadChatBundles(chatId, chat.members);
 
-    const messages = await messenger.getMessages(chatId, currentDeviceId);
+    // Fetch live messages (dual-source merge when historyDeviceId is set)
+    let messages = await loadChatMessages(chatId);
+
+    // Also merge in any locally-stored history snapshot (device-to-device sync path)
+    const snapshot = await loadHistorySnapshot().catch(() => null);
+    if (snapshot?.chats?.[chatId]?.length) {
+      const snapshotMsgs = snapshot.chats[chatId].map((m) => ({
+        id: m.id,
+        chat_id: chatId,
+        sender_id: m.sender_id,
+        sender_device_id: m.sender_device_id || null,
+        sender_username: m.sender_username,
+        encrypted_content: m.content, // already plaintext
+        nonce: "",
+        message_type: m.message_type,
+        created_at: m.created_at,
+        _decrypted: true,
+      }));
+      // Merge: REST messages override snapshots for the same message id
+      const map = new Map();
+      for (const m of snapshotMsgs) map.set(m.id, m);
+      for (const m of messages) map.set(m.id, m); // REST wins
+      messages = Array.from(map.values()).sort(
+        (a, b) => new Date(b.created_at) - new Date(a.created_at)
+      );
+    }
+
     const messagesEl = document.getElementById("chat-messages");
 
     // Decrypt all messages before rendering
@@ -3826,6 +4242,9 @@ if (auth.isLoggedIn()) {
   auth.me().then(async (user) => {
     currentUser = user;
     await initializeDevice();
+    // Load the history device id set after a recovery-code import so that
+    // message history fetches use the original device's ciphertext slot.
+    historyDeviceId = await loadHistoryDeviceId().catch(() => null);
     connectWs();
     startNotifPolling();
   }).catch(() => navigate("login"));

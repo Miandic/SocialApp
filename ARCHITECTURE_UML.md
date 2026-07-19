@@ -86,56 +86,56 @@ classDiagram
     }
 
     class Router {
-      +/api/auth
-      +/api/devices
-      +/api/users
-      +/api/posts
-      +/api/messenger
-      +/api/notifications
-      +/api/media
+      +api_auth
+      +api_devices
+      +api_users
+      +api_posts
+      +api_messenger
+      +api_notifications
+      +api_media
     }
 
     class AuthModule {
-      +POST /register
-      +POST /login
-      +POST /refresh
-      +POST /logout
-      +GET /me
-      +POST /verify-password
+      +POST_register
+      +POST_login
+      +POST_refresh
+      +POST_logout
+      +GET_me
+      +POST_verify_password
     }
     class UsersModule {
-      +GET /{username}
-      +PATCH /profile
-      +POST|DELETE /{username}/follow
-      +GET /followers|following
+      +GET_user_profile
+      +PATCH_profile
+      +POST_DELETE_follow
+      +GET_followers_following
     }
     class PostsModule {
-      +POST /
-      +GET /feed
-      +GET|DELETE /{id}
-      +POST|DELETE /{id}/like
+      +POST_create
+      +GET_feed
+      +GET_DELETE_post
+      +POST_DELETE_like
     }
     class MessengerModule {
-      +GET /ws
-      +POST|GET /chats
-      +GET /chats/{id}/messages
+      +GET_websocket
+      +POST_GET_chats
+      +GET_chat_messages
     }
     class DevicesModule {
-      +POST|GET /
-      +POST /{id}/approve
-      +DELETE /{id}
-      +POST /{id}/pre-keys
-      +GET /user-bundles/{user_id}
-      +POST|GET|DELETE /history-sync
+      +POST_GET_devices
+      +POST_approve_device
+      +DELETE_device
+      +POST_pre_keys
+      +GET_user_bundles
+      +POST_GET_DELETE_history_sync
     }
     class NotificationsModule {
-      +GET /
-      +GET /unread-count
-      +PATCH /read-all
-      +PATCH /{id}/read
+      +GET_notifications
+      +GET_unread_count
+      +PATCH_read_all
+      +PATCH_read_one
     }
     class MediaModule {
-      +POST /upload
+      +POST_upload
     }
 
     Router --> AppState
@@ -311,19 +311,82 @@ erDiagram
     USER_DEVICES ||--o{ HISTORY_SYNC_PACKAGES : sender
     USER_DEVICES ||--o{ HISTORY_SYNC_PACKAGES : recipient
 
-    USERS { uuid id PK; string username UK; string email UK; string password_hash }
-    FOLLOWS { uuid follower_id PK; uuid following_id PK }
-    POSTS { uuid id PK; uuid author_id FK; text content; text_array media_urls }
-    POST_LIKES { uuid user_id PK; uuid post_id PK }
-    CHATS { uuid id PK; boolean is_group; string name }
-    CHAT_MEMBERS { uuid chat_id PK; uuid user_id PK; uuid last_read_message_id FK }
-    MESSAGES { uuid id PK; uuid chat_id FK; uuid sender_id FK; uuid sender_device_id FK; text encrypted_content; text nonce }
-    USER_DEVICES { uuid id PK; uuid user_id FK; text identity_key; boolean is_verified }
-    ONE_TIME_PRE_KEYS { uuid id PK; uuid device_id FK; text key_data; boolean used }
-    MESSAGE_DEVICE_CIPHERTEXTS { uuid message_id PK; uuid device_id PK; text encrypted_content; text nonce }
-    NOTIFICATIONS { uuid id PK; uuid user_id FK; string notification_type; json data; boolean is_read }
-    REFRESH_TOKENS { uuid id PK; uuid user_id FK; text token_hash; datetime expires_at }
-    HISTORY_SYNC_PACKAGES { uuid id PK; uuid sender_device_id FK; uuid recipient_device_id FK; text ciphertext; datetime expires_at }
+    USERS {
+      uuid id PK
+      string username UK
+      string email UK
+      string password_hash
+    }
+    FOLLOWS {
+      uuid follower_id PK
+      uuid following_id PK
+    }
+    POSTS {
+      uuid id PK
+      uuid author_id FK
+      text content
+      text_array media_urls
+    }
+    POST_LIKES {
+      uuid user_id PK
+      uuid post_id PK
+    }
+    CHATS {
+      uuid id PK
+      boolean is_group
+      string name
+    }
+    CHAT_MEMBERS {
+      uuid chat_id PK
+      uuid user_id PK
+      uuid last_read_message_id FK
+    }
+    MESSAGES {
+      uuid id PK
+      uuid chat_id FK
+      uuid sender_id FK
+      uuid sender_device_id FK
+      text encrypted_content
+      text nonce
+    }
+    USER_DEVICES {
+      uuid id PK
+      uuid user_id FK
+      text identity_key
+      boolean is_verified
+    }
+    ONE_TIME_PRE_KEYS {
+      uuid id PK
+      uuid device_id FK
+      text key_data
+      boolean used
+    }
+    MESSAGE_DEVICE_CIPHERTEXTS {
+      uuid message_id PK
+      uuid device_id PK
+      text encrypted_content
+      text nonce
+    }
+    NOTIFICATIONS {
+      uuid id PK
+      uuid user_id FK
+      string notification_type
+      json data
+      boolean is_read
+    }
+    REFRESH_TOKENS {
+      uuid id PK
+      uuid user_id FK
+      text token_hash
+      datetime expires_at
+    }
+    HISTORY_SYNC_PACKAGES {
+      uuid id PK
+      uuid sender_device_id FK
+      uuid recipient_device_id FK
+      text ciphertext
+      datetime expires_at
+    }
 ```
 
 Схема формируется миграциями `0001_init.sql` и `0002_e2ee_devices.sql`. Вторая миграция переводит E2EE-ключи и one-time pre-keys с уровня пользователя на уровень устройства и добавляет ciphertext-per-device.
